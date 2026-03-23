@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+karazhan
+karazhan-linux
+karazhan-*
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
