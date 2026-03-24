@@ -98,6 +98,10 @@ func (m *serverListModel) rebuildFlat() {
 			if !groupMatch && !hasServerMatch {
 				continue
 			}
+			// Auto-expand groups with matching servers
+			if hasServerMatch {
+				m.expanded[i] = true
+			}
 		}
 
 		m.flatItems = append(m.flatItems, flatItem{groupIndex: i, serverIndex: -1})
@@ -161,6 +165,7 @@ func (m serverListModel) Update(msg tea.Msg) (serverListModel, tea.Cmd) {
 				m.searchInput.Blur()
 				m.searchInput.SetValue("")
 				m.filter = ""
+				m.expanded = make(map[int]bool)
 				m.rebuildFlat()
 				return m, nil
 			default:
@@ -183,6 +188,7 @@ func (m serverListModel) Update(msg tea.Msg) (serverListModel, tea.Cmd) {
 			if m.filter != "" {
 				m.searchInput.SetValue("")
 				m.filter = ""
+				m.expanded = make(map[int]bool)
 				m.rebuildFlat()
 				return m, nil
 			}
