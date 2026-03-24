@@ -8,6 +8,7 @@ import (
 	"Karazhan/internal/server"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -21,6 +22,8 @@ type serverListModel struct {
 	loading   bool
 	err       string
 	filter    string
+	searching bool
+	searchInput textinput.Model
 	cacheInfo string
 	spinner   spinner.Model
 	toast     string
@@ -46,10 +49,18 @@ func newServerListModel() serverListModel {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = selectedStyle
+
+	ti := textinput.New()
+	ti.Placeholder = "hostname, ip, or #tag"
+	ti.CharLimit = 64
+	ti.Width = 30
+	ti.Prompt = "🔍 "
+
 	return serverListModel{
-		expanded: make(map[int]bool),
-		spinner:  s,
-		viewMode: server.ViewByServerGroup, // default
+		expanded:    make(map[int]bool),
+		spinner:     s,
+		searchInput: ti,
+		viewMode:    server.ViewByServerGroup, // default
 	}
 }
 
@@ -102,6 +113,21 @@ func (m *serverListModel) rebuildFlat() {
 }
 
 func matchServer(srv server.CIServer, f string) bool {
+	// [3] Tag search: # prefix
+	if strings.HasPrefix(f, "#") {
+		tagQuery := strings.TrimPrefix(f, "#")
+		if tagQuery == "" {
+			return len(srv.AllTags()) > 0
+		}
+		for _, t := range srv.AllTags() {
+			if strings.Contains(strings.ToLower(t), tagQuery) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// [1] Hostname + [2] IP: unified substring search
 	return strings.Contains(strings.ToLower(srv.HostName), f) ||
 		strings.Contains(strings.ToLower(srv.IP), f)
 }
@@ -123,7 +149,43 @@ func (m *serverListModel) switchViewMode() tea.Cmd {
 func (m serverListModel) Update(msg tea.Msg) (serverListModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Search mode: forward input to textinput
+		if m.searching {
+			switch msg.String() {
+			case "enter":
+				m.searching = false
+				m.searchInput.Blur()
+				return m, nil
+			case "esc":
+				m.searching = false
+				m.searchInput.Blur()
+				m.searchInput.SetValue("")
+				m.filter = ""
+				m.rebuildFlat()
+				return m, nil
+			default:
+				var cmd tea.Cmd
+				m.searchInput, cmd = m.searchInput.Update(msg)
+				m.filter = m.searchInput.Value()
+				m.cursor = 0
+				m.rebuildFlat()
+				return m, cmd
+			}
+		}
+
+		// Normal mode
 		switch msg.String() {
+		case "/":
+			m.searching = true
+			m.searchInput.Focus()
+			return m, m.searchInput.Cursor.BlinkCmd()
+		case "esc":
+			if m.filter != "" {
+				m.searchInput.SetValue("")
+				m.filter = ""
+				m.rebuildFlat()
+				return m, nil
+			}
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
@@ -202,7 +264,16 @@ func (m serverListModel) View(width, height int) string {
 	if m.toast != "" {
 		b.WriteString("  " + successStyle.Render("✓ "+m.toast))
 	}
-	b.WriteString("\n\n")
+	b.WriteString("\n")
+
+	// Search bar
+	if m.searching {
+		b.WriteString("  " + m.searchInput.View() + "\n")
+	} else if m.filter != "" {
+		b.WriteString("  " + dimStyle.Render(fmt.Sprintf("filter: \"%s\"  (esc: clear)", m.filter)) + "\n")
+	} else {
+		b.WriteString("\n")
+	}
 
 	if m.loading {
 		b.WriteString(fmt.Sprintf("  %s Refreshing servers...\n", m.spinner.View()))
@@ -274,7 +345,13 @@ func (m serverListModel) renderList(b *strings.Builder, width, height int) {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("  ↑↓/jk: navigate • enter: expand/select • tab: view mode • r: refresh • q: quit"))
+	if m.searching {
+		b.WriteString(helpStyle.Render("  type to search • enter: confirm • esc: cancel"))
+	} else if m.filter != "" {
+		b.WriteString(helpStyle.Render("  ↑↓/jk: navigate • enter: expand/select • /: search • esc: clear filter • tab: view mode • r: refresh • q: quit"))
+	} else {
+		b.WriteString(helpStyle.Render("  ↑↓/jk: navigate • enter: expand/select • /: search • tab: view mode • r: refresh • q: quit"))
+	}
 }
 
 func (m serverListModel) renderGroupHeader(b *strings.Builder, i int, item flatItem, prefix string) {

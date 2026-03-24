@@ -95,17 +95,30 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Let search mode handle its own keys first
+		if m.screen == screenServers && m.serverList.searching {
+			var searchCmd tea.Cmd
+			m.serverList, searchCmd = m.serverList.Update(msg)
+			return m, searchCmd
+		}
 		switch msg.String() {
 		case "ctrl+c":
 			m.muxMgr.CloseAll()
 			return m, tea.Quit
 		case "q":
 			if m.screen == screenServers {
+				if m.serverList.filter != "" {
+					// esc clears filter, q should not quit while filtered
+					break
+				}
 				m.muxMgr.CloseAll()
 				return m, tea.Quit
 			}
 		case "esc":
 			switch m.screen {
+			case screenServers:
+				// Let serverList.Update handle esc for clearing filter
+				break
 			case screenUserSelect:
 				m.screen = screenServers
 				return m, nil
@@ -160,14 +173,16 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case screenServers:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
-			switch msg.String() {
-			case "r":
-				m.serverList.loading = true
-				return m, tea.Batch(m.refreshServers(), m.serverList.spinner.Tick)
-			case "m":
-				// Re-enter multiplexer if sessions exist
-				if m.muxMgr.SessionCount() > 0 {
-					return m, m.enterMux()
+			if !m.serverList.searching {
+				switch msg.String() {
+				case "r":
+					m.serverList.loading = true
+					return m, tea.Batch(m.refreshServers(), m.serverList.spinner.Tick)
+				case "m":
+					// Re-enter multiplexer if sessions exist
+					if m.muxMgr.SessionCount() > 0 {
+						return m, m.enterMux()
+					}
 				}
 			}
 		case serverSelectedMsg:
