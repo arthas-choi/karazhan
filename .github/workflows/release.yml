@@ -30,9 +30,9 @@ jobs:
           VERSION=${GITHUB_REF_NAME}
           LDFLAGS="-s -w -X main.version=${VERSION}"
 
-          GOOS=linux  GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o build/karazhan-linux-amd64 .
-          GOOS=darwin GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o build/karazhan-darwin-amd64 .
-          GOOS=darwin GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o build/karazhan-darwin-arm64 .
+          CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o build/karazhan-linux-amd64 .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o build/karazhan-darwin-amd64 .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o build/karazhan-darwin-arm64 .
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
