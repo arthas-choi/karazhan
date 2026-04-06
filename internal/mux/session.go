@@ -26,7 +26,7 @@ type Session struct {
 	err  error
 }
 
-func newSession(id int, name, user, ip string, cols, rows int, mock bool) (*Session, error) {
+func newSession(id int, name, user, ipOrHostName string, cols, rows int, mock bool) (*Session, error) {
 	var cmd *exec.Cmd
 	if mock {
 		shell := os.Getenv("SHELL")
@@ -40,7 +40,7 @@ func newSession(id int, name, user, ip string, cols, rows int, mock bool) (*Sess
 			"-o", "GSSAPIDelegateCredentials=yes",
 			"-o", "StrictHostKeyChecking=no",
 			"-l", user,
-			ip,
+			ipOrHostName,
 		)
 	}
 
@@ -53,7 +53,7 @@ func newSession(id int, name, user, ip string, cols, rows int, mock bool) (*Sess
 		ID:   id,
 		Name: name,
 		User: user,
-		IP:   ip,
+		IP:   ipOrHostName,
 		cmd:  cmd,
 		ptmx: ptmx,
 		vt:   vt10x.New(vt10x.WithSize(cols, rows)),

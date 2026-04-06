@@ -51,7 +51,7 @@ type Runner struct {
 	stderr io.Writer
 }
 
-func (r *Runner) Run() error              { return r.Mgr.Run() }
+func (r *Runner) Run() error               { return r.Mgr.Run() }
 func (r *Runner) SetStdin(in io.Reader)    { r.stdin = in }
 func (r *Runner) SetStdout(out io.Writer)  { r.stdout = out }
 func (r *Runner) SetStderr(errw io.Writer) { r.stderr = errw }
@@ -63,11 +63,11 @@ func NewManager(mock bool) *Manager {
 	}
 }
 
-func (m *Manager) AddSession(name, user, ip string) error {
+func (m *Manager) AddSession(name, user, ipOrHostName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	s, err := newSession(m.nextID, name, user, ip, 80, 24, m.mock)
+	s, err := newSession(m.nextID, name, user, ipOrHostName, 80, 24, m.mock)
 	if err != nil {
 		return err
 	}

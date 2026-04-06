@@ -338,7 +338,7 @@ func (m appModel) connectSSH() tea.Cmd {
 	srv := m.selectedServer
 
 	// Add session to multiplexer
-	err := m.muxMgr.AddSession(srv.HostName, m.sshUser, srv.PrimaryIP())
+	err := m.muxMgr.AddSession(srv.HostName, m.sshUser, srv.HostName)
 	if err != nil {
 		return func() tea.Msg {
 			return muxDoneMsg{}
