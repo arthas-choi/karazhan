@@ -41,10 +41,12 @@ type appModel struct {
 func NewApp(cfg *config.Config) appModel {
 	login := newLoginModel()
 	login.mock = cfg.KerberosMock
+	sl := newServerListModel()
+	sl.cfg = cfg
 	return appModel{
 		cfg:        cfg,
 		login:      login,
-		serverList: newServerListModel(),
+		serverList: sl,
 		muxMgr:     mux.NewManager(cfg.ServersMock),
 	}
 }

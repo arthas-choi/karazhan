@@ -83,6 +83,15 @@ func (s *Session) Resize(rows, cols uint16) {
 	s.mu.Unlock()
 }
 
+// ResizeWithClear resizes and clears the VT buffer.
+// Used when transitioning between single/split modes so stale content is flushed.
+func (s *Session) ResizeWithClear(rows, cols uint16) {
+	_ = pty.Setsize(s.ptmx, &pty.Winsize{Rows: rows, Cols: cols})
+	s.mu.Lock()
+	s.vt = vt10x.New(vt10x.WithSize(int(cols), int(rows)))
+	s.mu.Unlock()
+}
+
 func (s *Session) Read(buf []byte) (int, error) {
 	return s.ptmx.Read(buf)
 }
@@ -96,6 +105,13 @@ func (s *Session) WriteToVT(data []byte) {
 	s.mu.Lock()
 	s.vt.Write(data)
 	s.mu.Unlock()
+}
+
+// VTSize returns the current VT terminal dimensions (cols, rows).
+func (s *Session) VTSize() (cols, rows int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.vt.Size()
 }
 
 // CellAt returns the glyph at (col, row) from the virtual terminal.

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"Karazhan/internal/config"
 	"Karazhan/internal/server"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -13,6 +14,7 @@ import (
 )
 
 type serverListModel struct {
+	cfg       *config.Config
 	nodes     []server.ESMNode
 	viewMode  server.ViewMode
 	groups    []server.GroupView
@@ -71,10 +73,17 @@ func (m *serverListModel) setNodes(nodes []server.ESMNode, cacheInfo string) {
 }
 
 func (m *serverListModel) rebuildGroups() {
-	m.groups = server.BuildGroups(m.nodes, m.viewMode)
+	m.groups = server.BuildGroups(m.nodes, m.viewMode, m.bookmarks())
 	m.expanded = make(map[int]bool)
 	m.cursor = 0
 	m.rebuildFlat()
+}
+
+func (m *serverListModel) bookmarks() []string {
+	if m.cfg == nil {
+		return nil
+	}
+	return m.cfg.Bookmarks
 }
 
 func (m *serverListModel) rebuildFlat() {
@@ -221,6 +230,34 @@ func (m serverListModel) Update(msg tea.Msg) (serverListModel, tea.Cmd) {
 					m.rebuildFlat()
 				}
 			}
+		case "B":
+			if m.cfg != nil && len(m.cfg.Bookmarks) > 0 {
+				m.cfg.ClearBookmarks()
+				_ = m.cfg.Save()
+				if m.viewMode == server.ViewByBookmark {
+					m.rebuildGroups()
+				}
+				toastCmd := m.setToast("☆ All bookmarks cleared")
+				return m, toastCmd
+			}
+		case "b":
+			if m.cursor < len(m.flatItems) {
+				item := m.flatItems[m.cursor]
+				if item.serverIndex >= 0 {
+					srv := m.groups[item.groupIndex].Servers[item.serverIndex]
+					added := m.cfg.ToggleBookmark(srv.HostName)
+					_ = m.cfg.Save()
+					if m.viewMode == server.ViewByBookmark {
+						m.rebuildGroups()
+					}
+					label := "★ Bookmarked: "
+					if !added {
+						label = "☆ Removed: "
+					}
+					toastCmd := m.setToast(label + srv.HostName)
+					return m, toastCmd
+				}
+			}
 		case "tab":
 			cmd := m.switchViewMode()
 			return m, cmd
@@ -307,7 +344,7 @@ func (m serverListModel) View(width, height int) string {
 }
 
 func (m serverListModel) renderViewModeTabs() string {
-	modes := []server.ViewMode{server.ViewByESM, server.ViewByServerGroup, server.ViewByPrefix}
+	modes := []server.ViewMode{server.ViewByESM, server.ViewByServerGroup, server.ViewByPrefix, server.ViewByBookmark}
 	var parts []string
 	for _, mode := range modes {
 		label := mode.Label()
@@ -354,9 +391,9 @@ func (m serverListModel) renderList(b *strings.Builder, width, height int) {
 	if m.searching {
 		b.WriteString(helpStyle.Render("  type to search • enter: confirm • esc: cancel"))
 	} else if m.filter != "" {
-		b.WriteString(helpStyle.Render("  ↑↓/jk: navigate • enter: expand/select • /: search • esc: clear filter • tab: view mode • r: refresh • q: quit"))
+		b.WriteString(helpStyle.Render("  ↑↓/jk: navigate • enter: expand/select • b: bookmark • B: clear all • /: search • esc: clear filter • tab: view mode • r: refresh • q: quit"))
 	} else {
-		b.WriteString(helpStyle.Render("  ↑↓/jk: navigate • enter: expand/select • /: search • tab: view mode • r: refresh • q: quit"))
+		b.WriteString(helpStyle.Render("  ↑↓/jk: navigate • enter: expand/select • b: bookmark • B: clear all • /: search • tab: view mode • r: refresh • q: quit"))
 	}
 }
 
@@ -398,7 +435,11 @@ func (m serverListModel) renderGroupHeader(b *strings.Builder, i int, item flatI
 func (m serverListModel) renderServerRow(b *strings.Builder, i int, item flatItem, prefix string) {
 	srv := m.groups[item.groupIndex].Servers[item.serverIndex]
 
-	host := fmt.Sprintf("%s    %s", prefix, srv.HostName)
+	bookmark := ""
+	if m.cfg != nil && m.cfg.IsBookmarked(srv.HostName) {
+		bookmark = "★ "
+	}
+	host := fmt.Sprintf("%s    %s%s", prefix, bookmark, srv.HostName)
 	ip := fmt.Sprintf(" %s", srv.PrimaryIP())
 	idc := ""
 	if srv.IDCName != "" {

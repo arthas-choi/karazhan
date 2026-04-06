@@ -59,6 +59,8 @@ const (
 	ViewByESM         ViewMode = iota // 1: ESM별
 	ViewByServerGroup                 // 2: 서버그룹별
 	ViewByPrefix                      // 3: Prefix별
+	ViewByBookmark                    // 4: 북마크
+	viewModeCount                     // sentinel for modulo
 )
 
 func (v ViewMode) Label() string {
@@ -69,12 +71,14 @@ func (v ViewMode) Label() string {
 		return "ServerGroup"
 	case ViewByPrefix:
 		return "Prefix"
+	case ViewByBookmark:
+		return "★ Bookmark"
 	}
 	return ""
 }
 
 func (v ViewMode) Next() ViewMode {
-	return (v + 1) % 3
+	return (v + 1) % viewModeCount
 }
 
 // GroupView is a unified group for display, regardless of ViewMode.
@@ -86,7 +90,8 @@ type GroupView struct {
 }
 
 // BuildGroups creates groups from ESM nodes based on the given ViewMode.
-func BuildGroups(nodes []ESMNode, mode ViewMode) []GroupView {
+// bookmarks is only used for ViewByBookmark mode.
+func BuildGroups(nodes []ESMNode, mode ViewMode, bookmarks ...[]string) []GroupView {
 	switch mode {
 	case ViewByESM:
 		return groupByESM(nodes)
@@ -94,6 +99,12 @@ func BuildGroups(nodes []ESMNode, mode ViewMode) []GroupView {
 		return groupByServerGroup(nodes)
 	case ViewByPrefix:
 		return groupByPrefix(nodes)
+	case ViewByBookmark:
+		var bm []string
+		if len(bookmarks) > 0 {
+			bm = bookmarks[0]
+		}
+		return groupByBookmark(nodes, bm)
 	}
 	return nil
 }
@@ -194,6 +205,31 @@ func groupByPrefix(nodes []ESMNode) []GroupView {
 		result = append(result, *groupMap[key])
 	}
 	return result
+}
+
+func groupByBookmark(nodes []ESMNode, bookmarks []string) []GroupView {
+	if len(bookmarks) == 0 {
+		return []GroupView{{GroupName: "Bookmarks", Badge: "★", Servers: nil}}
+	}
+	bmSet := make(map[string]bool, len(bookmarks))
+	for _, b := range bookmarks {
+		bmSet[b] = true
+	}
+
+	var servers []CIServer
+	seen := make(map[string]bool)
+	for _, node := range nodes {
+		for _, srv := range node.CIServerList {
+			if bmSet[srv.HostName] && !seen[srv.HostName] {
+				seen[srv.HostName] = true
+				servers = append(servers, srv)
+			}
+		}
+	}
+	sort.Slice(servers, func(i, j int) bool {
+		return servers[i].HostName < servers[j].HostName
+	})
+	return []GroupView{{GroupName: "Bookmarks", Badge: "★", Servers: servers}}
 }
 
 func joinParts(parts []string, sep string) string {

@@ -72,10 +72,20 @@ func renderPaneToBuf(buf *bytes.Buffer, s *Session, p Pane) {
 	lastFG = 0xFFFFFFFF
 	lastBG = 0xFFFFFFFF
 
-	for row := 0; row < p.Height; row++ {
+	vtCols, vtRows := s.VTSize()
+	renderH := p.Height
+	renderW := p.Width
+	if renderH > vtRows {
+		renderH = vtRows
+	}
+	if renderW > vtCols {
+		renderW = vtCols
+	}
+
+	for row := 0; row < renderH; row++ {
 		fmt.Fprintf(buf, "\033[%d;%dH", p.Row+row, p.Col)
 
-		for col := 0; col < p.Width; col++ {
+		for col := 0; col < renderW; col++ {
 			cell := s.CellAt(col, row)
 			ch := cell.Char
 			if ch == 0 {

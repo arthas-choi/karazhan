@@ -14,6 +14,34 @@ type Config struct {
 	API          APIConfig `yaml:"api"`
 	SSH          SSHConfig `yaml:"ssh"`
 	CacheDir     string    `yaml:"cache_dir"`
+	Bookmarks    []string  `yaml:"bookmarks,omitempty"`
+}
+
+// IsBookmarked checks if a hostname is bookmarked.
+func (c *Config) IsBookmarked(hostname string) bool {
+	for _, b := range c.Bookmarks {
+		if b == hostname {
+			return true
+		}
+	}
+	return false
+}
+
+// ClearBookmarks removes all bookmarks.
+func (c *Config) ClearBookmarks() {
+	c.Bookmarks = nil
+}
+
+// ToggleBookmark adds or removes a hostname from bookmarks. Returns true if added.
+func (c *Config) ToggleBookmark(hostname string) bool {
+	for i, b := range c.Bookmarks {
+		if b == hostname {
+			c.Bookmarks = append(c.Bookmarks[:i], c.Bookmarks[i+1:]...)
+			return false
+		}
+	}
+	c.Bookmarks = append(c.Bookmarks, hostname)
+	return true
 }
 
 type APIConfig struct {

@@ -21,7 +21,7 @@ func (m *Manager) drawTabBar(row, cols int) {
 	var tabs []string
 	m.mu.Lock()
 	for i, s := range m.sessions {
-		label := fmt.Sprintf(" %d:%s ", i+1, s.Name)
+		label := fmt.Sprintf(" %d:%s@%s ", i+1, s.User, s.Name)
 		if s.IsDone() {
 			label += "(x) "
 		}
@@ -84,6 +84,7 @@ func (m *Manager) drawHelp(rows, cols int) {
 		"",
 		"  Ctrl+A d       Detach (back to server list)",
 		"  Ctrl+A c       New tab (select server)",
+		"  Ctrl+A u       Switch user (irteam ↔ irteamsu)",
 		"  Ctrl+A x       Close current tab/pane",
 		"",
 		"  Ctrl+A n / ]   Next tab",

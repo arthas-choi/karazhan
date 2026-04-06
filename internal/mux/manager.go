@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -289,7 +290,8 @@ func (m *Manager) handlePrefixKey(b byte, running *atomic.Bool, helpShown *bool,
 	case 'z', 'Z':
 		if m.split != SplitNone {
 			m.split = SplitNone
-			m.applyLayout(rows, cols)
+			fmt.Fprint(os.Stdout, "\033[2J\033[H")
+			m.applyLayoutWithClear(rows, cols)
 		}
 
 	// Focus switch
@@ -298,6 +300,42 @@ func (m *Manager) handlePrefixKey(b byte, running *atomic.Bool, helpShown *bool,
 			m.splitFocus = 1 - m.splitFocus
 			m.mu.Lock()
 			m.activeIdx = m.splitPanes[m.splitFocus]
+			m.mu.Unlock()
+		}
+
+	case 'u', 'U':
+		m.mu.Lock()
+		if m.activeIdx >= 0 && m.activeIdx < len(m.sessions) {
+			cur := m.sessions[m.activeIdx]
+			newUser := "irteamsu"
+			if cur.User == "irteamsu" {
+				newUser = "irteam"
+			}
+			name := cur.Name
+			ip := cur.IP
+			// Check if session with same server+user already exists
+			existingIdx := -1
+			for i, s := range m.sessions {
+				if s.Name == name && s.User == newUser && !s.IsDone() {
+					existingIdx = i
+					break
+				}
+			}
+			if existingIdx >= 0 {
+				// Switch to existing session
+				m.activeIdx = existingIdx
+				if m.split != SplitNone {
+					m.splitPanes[m.splitFocus] = existingIdx
+				}
+				m.mu.Unlock()
+				m.applyLayout(rows, cols)
+			} else {
+				m.mu.Unlock()
+				if err := m.AddSession(name, newUser, ip); err == nil {
+					m.applyLayout(rows, cols)
+				}
+			}
+		} else {
 			m.mu.Unlock()
 		}
 
@@ -375,13 +413,26 @@ func (m *Manager) enterSplit(mode SplitMode, rows, cols int) {
 	m.splitPanes[0] = m.activeIdx
 	m.splitPanes[1] = (m.activeIdx + 1) % len(m.sessions)
 	m.mu.Unlock()
-	m.applyLayout(rows, cols)
+	fmt.Fprint(os.Stdout, "\033[2J\033[H")
+	m.applyLayoutWithClear(rows, cols)
 }
 
 func (m *Manager) applyLayout(rows, cols int) {
+	m.applyLayoutInner(rows, cols, false)
+}
+
+func (m *Manager) applyLayoutWithClear(rows, cols int) {
+	m.applyLayoutInner(rows, cols, true)
+}
+
+func (m *Manager) applyLayoutInner(rows, cols int, clearVT bool) {
 	if m.split == SplitNone {
 		fmt.Fprintf(os.Stdout, "\033[1;%dr", rows-1)
-		m.resizeAll(uint16(rows-1), uint16(cols))
+		if clearVT {
+			m.resizeAllWithClear(uint16(rows-1), uint16(cols))
+		} else {
+			m.resizeAll(uint16(rows-1), uint16(cols))
+		}
 		m.drawTabBar(rows, cols)
 		m.switchToActive(rows, cols)
 	} else {
@@ -390,7 +441,11 @@ func (m *Manager) applyLayout(rows, cols int) {
 		m.mu.Lock()
 		for _, p := range panes {
 			if p.SessionIdx >= 0 && p.SessionIdx < len(m.sessions) {
-				m.sessions[p.SessionIdx].Resize(uint16(p.Height), uint16(p.Width))
+				if clearVT {
+					m.sessions[p.SessionIdx].ResizeWithClear(uint16(p.Height), uint16(p.Width))
+				} else {
+					m.sessions[p.SessionIdx].Resize(uint16(p.Height), uint16(p.Width))
+				}
 			}
 		}
 		m.mu.Unlock()
@@ -448,13 +503,64 @@ func (m *Manager) switchToActive(rows, cols int) {
 	m.mu.Lock()
 	if m.activeIdx >= 0 && m.activeIdx < len(m.sessions) {
 		s := m.sessions[m.activeIdx]
+		idx := m.activeIdx
 		m.mu.Unlock()
 		fmt.Fprintf(os.Stdout, "\033[2J\033[H")
 		s.Resize(uint16(rows-1), uint16(cols))
 		m.drawTabBar(rows, cols)
+		// Render current VT buffer content to screen immediately
+		// so the user doesn't see a blank screen until new data arrives.
+		m.renderActiveFromVT(idx, rows, cols)
 		return
 	}
 	m.mu.Unlock()
+}
+
+// renderActiveFromVT draws the VT buffer of the active session to stdout.
+func (m *Manager) renderActiveFromVT(idx int, rows, cols int) {
+	m.mu.Lock()
+	if idx < 0 || idx >= len(m.sessions) {
+		m.mu.Unlock()
+		return
+	}
+	s := m.sessions[idx]
+	m.mu.Unlock()
+
+	vtCols, vtRows := s.VTSize()
+	usable := rows - 1
+	if usable > vtRows {
+		usable = vtRows
+	}
+	renderW := cols
+	if renderW > vtCols {
+		renderW = vtCols
+	}
+
+	var buf bytes.Buffer
+	buf.Grow(usable * renderW * 3)
+	buf.WriteString("\033[?25l")
+	buf.WriteString("\033[H")
+
+	for row := 0; row < usable; row++ {
+		fmt.Fprintf(&buf, "\033[%d;1H", row+1)
+		for col := 0; col < renderW; col++ {
+			cell := s.CellAt(col, row)
+			ch := cell.Char
+			if ch == 0 {
+				ch = ' '
+			}
+			buf.WriteRune(ch)
+		}
+	}
+
+	// Restore cursor position
+	curCol, curRow := s.CursorPos()
+	if curRow < usable && curCol < renderW {
+		fmt.Fprintf(&buf, "\033[%d;%dH", curRow+1, curCol+1)
+	}
+	buf.WriteString("\033[?25h")
+
+	os.Stdout.Write(buf.Bytes())
 }
 
 func (m *Manager) resizeAll(rows, cols uint16) {
@@ -462,6 +568,14 @@ func (m *Manager) resizeAll(rows, cols uint16) {
 	defer m.mu.Unlock()
 	for _, s := range m.sessions {
 		s.Resize(rows, cols)
+	}
+}
+
+func (m *Manager) resizeAllWithClear(rows, cols uint16) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.sessions {
+		s.ResizeWithClear(rows, cols)
 	}
 }
 
