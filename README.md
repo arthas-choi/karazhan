@@ -9,7 +9,7 @@ Karazhan provides a TUI (Terminal User Interface) for browsing, searching, and c
 - **Kerberos Authentication** - Integrated `kinit`/`klist` for seamless GSSAPI SSH
 - **Server Discovery** - Fetch server lists from TIPS API with local caching
 - **Smart Grouping** - View servers by ESM code, server group, or hostname prefix
-- **Built-in Multiplexer** - Tabs, horizontal/vertical split panes, focus switching
+- **Built-in Multiplexer** - A tab per server with `irteam`/`irteamsu` sessions side by side, split presets (2-way, main+stack, 2x2), zoom and broadcast, all rendered next to the server list
 - **Cross-platform** - Linux (amd64), macOS (amd64, arm64)
 
 ## Quick Start

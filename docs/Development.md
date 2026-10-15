@@ -102,6 +102,8 @@ Where `VERSION` comes from `git describe --tags --always --dirty`.
 | [lipgloss](https://github.com/charmbracelet/lipgloss) | Terminal styling |
 | [pty](https://github.com/creack/pty) | Pseudo-terminal allocation |
 | [vt10x](https://github.com/hinshun/vt10x) | VT100 terminal emulation |
+| [go-runewidth](https://github.com/mattn/go-runewidth) | Display width of CJK / wide characters |
+| [x/ansi](https://github.com/charmbracelet/x) | ANSI-aware string width and truncation |
 | [yaml.v3](https://gopkg.in/yaml.v3) | YAML config parsing |
 
 ## Adding a New Screen
@@ -114,9 +116,12 @@ Where `VERSION` comes from `git describe --tags --always --dirty`.
 ## Adding a New Multiplexer Command
 
 1. Open `internal/mux/manager.go`
-2. Add a case in the `handlePrefix` method
-3. Implement the handler function
-4. Update the help text in `internal/mux/tabbar.go`
+2. Add a case in `handlePrefixKeyLocked` (the manager mutex is already held;
+   return an `Action` if the host UI has to react, e.g. change focus)
+3. Implement the handler as a `...Locked` method
+4. Update `helpLines` in `internal/mux/tabbar.go` and the key tables in `README.md`
+5. Add a case to `TestPrefixActions` in `internal/mux/render_test.go` if the
+   command changes layout or focus
 
 ## Modifying Server Grouping
 

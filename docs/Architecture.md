@@ -15,21 +15,28 @@ Karazhan is a Go TUI application built on the [Bubble Tea](https://github.com/ch
 │                  internal/tui                    │
 │         Bubble Tea TUI (Elm Architecture)        │
 │                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │  Login   │→ │ Servers  │→ │  UserSelect   │  │
-│  │  Screen  │  │  Screen  │  │    Screen     │  │
-│  └──────────┘  └──────────┘  └───────┬───────┘  │
-└──────────────────────────────────────┼──────────┘
-                                       │
-                                       ▼
+│  ┌──────────┐    ┌────────────────────────────┐  │
+│  │  Login   │ →  │       Servers screen       │  │
+│  │  Screen  │    │ ┌──────────┐ ┌───────────┐ │  │
+│  └──────────┘    │ │  Server  │ │ Terminal  │ │  │
+│                  │ │   list   │ │   area    │ │  │
+│                  │ └──────────┘ └─────┬─────┘ │  │
+│                  └─────────────────────┼───────┘  │
+└────────────────────────────────────────┼─────────┘
+                                         │ View() / HandleInput()
+                                         ▼
 ┌─────────────────────────────────────────────────┐
 │                  internal/mux                    │
-│            Terminal Multiplexer                   │
+│    Terminal Multiplexer (renders a text frame)   │
 │                                                  │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐         │
-│  │ Session │  │ Session │  │ Session │  ...     │
-│  │  (PTY)  │  │  (PTY)  │  │  (PTY)  │         │
-│  └─────────┘  └─────────┘  └─────────┘         │
+│  ┌──────────────────┐  ┌──────────────────┐     │
+│  │  Tab (server A)  │  │  Tab (server B)  │ ... │
+│  │ ┌──────┐┌──────┐ │  │ ┌──────┐         │     │
+│  │ │irteam││irteam│ │  │ │irteam│         │     │
+│  │ │      ││  su  │ │  │ │      │         │     │
+│  │ └──────┘└──────┘ │  │ └──────┘         │     │
+│  └──────────────────┘  └──────────────────┘     │
+│     Session = PTY + vt10x virtual terminal       │
 └─────────────────────────────────────────────────┘
 
 ┌──────────────────┐  ┌──────────────────┐
@@ -55,16 +62,19 @@ internal/
 │   ├── model.go    # Data models, grouping logic
 │   └── cache.go    # API fetching, JSON caching
 ├── tui/            # Terminal UI screens
-│   ├── app.go      # Main app model (screen router)
+│   ├── app.go      # Main app model: screen router, list/terminal focus, layout
 │   ├── login.go    # Kerberos login screen
-│   ├── servers.go  # Server list & selection
+│   ├── servers.go  # Server list panel, search, bookmarks, connect modes
+│   ├── keys.go     # Bubble Tea key events → terminal byte sequences
 │   ├── styles.go   # Lipgloss style definitions
 │   └── mock.go     # Mock data for development
 └── mux/            # Terminal multiplexer
-    ├── manager.go  # Session manager (input/output routing)
-    ├── session.go  # Individual SSH session (PTY wrapper)
-    ├── render.go   # Split-pane compositor
-    ├── layout.go   # Pane layout calculations
+    ├── manager.go  # Tabs, panes, Ctrl+A commands, input routing
+    ├── tab.go      # Tab = one server, one session per SSH user
+    ├── session.go  # SSH session: PTY + vt10x virtual terminal
+    ├── widefilter.go # Pads double-width (CJK) characters for vt10x
+    ├── layout.go   # Split presets, pane geometry, directional focus
+    ├── render.go   # Cell-grid frame compositor (panes, headers, cursor)
     └── tabbar.go   # Tab bar & help overlay
 ```
 
@@ -108,50 +118,88 @@ Server List Screen
 ### SSH Connection
 
 ```
-Server Selected → User Selected (irteam/irteamsu)
+Server selected in the list
   │
-  ├─ ssh -o GSSAPIAuthentication=yes
-  │      -o GSSAPIDelegateCredentials=yes
-  │      -o StrictHostKeyChecking=no
-  │      -l <user> <ip>
+  ├─ Enter / l  → focus the server's tab, or open one as the default user
+  ├─ s          → focus the server's tab and switch it to irteamsu
+  └─ o          → always open a new tab as the default user
   │
-  ├─ PTY allocated (creack/pty)
-  ├─ Session added to Manager
-  └─ Bubble Tea hands control to Multiplexer (tea.Exec)
+  ├─ Manager.OpenTab / FocusServer / SwitchUser
+  │   ├─ ssh -o GSSAPIAuthentication=yes
+  │   │      -o GSSAPIDelegateCredentials=yes
+  │   │      -o StrictHostKeyChecking=no
+  │   │      -l <user> <hostname>
+  │   ├─ PTY allocated (creack/pty, sized to the pane)
+  │   └─ Session added to the server's Tab
+  │
+  └─ Keyboard focus moves to the terminal area (same Bubble Tea screen)
 ```
 
 ### Multiplexer
 
 ```
-Manager.Run()
+Bubble Tea event loop (internal/tui)
   │
-  ├─ Input Loop (main goroutine)
-  │   ├─ Read stdin
-  │   ├─ Ctrl+A prefix → dispatch command
-  │   └─ Forward to focused session PTY
+  ├─ Key while the terminal area has focus
+  │   ├─ keyToBytes() → terminal byte sequence
+  │   └─ Manager.HandleInput(bytes)
+  │       ├─ Ctrl+A prefix → dispatch command
+  │       │   └─ returns an Action (focus list, toggle list) for the host UI
+  │       └─ otherwise → write to the focused session's PTY
+  │                      (or to every pane while broadcasting)
   │
-  ├─ Output Relay (per-session goroutine)
-  │   ├─ Read from session PTY
-  │   ├─ Tab mode: write directly to stdout
-  │   └─ Split mode: write to vt10x virtual terminal
+  ├─ View() → Manager.View(focused)
+  │   ├─ Paint the tab bar into a cell-grid frame
+  │   ├─ Copy each pane's vt10x screen into the frame
+  │   ├─ Draw pane headers, separators, cursor, help overlay
+  │   └─ Serialize the frame to a string placed beside the server list
   │
-  ├─ Render Ticker (split mode, ~10fps)
-  │   ├─ Read all virtual terminals
-  │   ├─ Composite panes with separators
-  │   └─ Write to stdout
+  ├─ WindowSizeMsg → Manager.SetSize → resize PTYs to their panes
   │
-  └─ SIGWINCH handler → resize all PTYs
+  └─ termUpdateMsg (coalesced, ~16 ms)
+      └─ Manager.Prune → drop finished sessions and empty tabs
+
+Per-session goroutine (Manager.readLoop)
+  ├─ Read from the PTY
+  ├─ wideFilter pads double-width characters
+  ├─ Write into the session's vt10x virtual terminal
+  └─ Signal the Updates channel → Bubble Tea redraws
 ```
 
 ## Key Design Decisions
 
-### Bubble Tea + raw exec for multiplexer
+### Multiplexer rendered inside Bubble Tea
 
-The TUI screens (login, server list) run inside Bubble Tea's event loop. When entering the multiplexer, `tea.Exec` is used to hand over raw terminal control to the Manager, bypassing Bubble Tea's abstraction. This allows direct PTY I/O with minimal latency.
+The multiplexer does no terminal I/O of its own. It keeps every session in a
+vt10x virtual terminal and composites them into a text frame that the Bubble
+Tea view places next to the server list. This lets the list and the terminal
+area share one screen with a single focus model, and avoids switching the
+real terminal in and out of raw mode. Key events are converted back into
+terminal byte sequences (`internal/tui/keys.go`) before being forwarded to a
+PTY, honouring application cursor mode for programs like vim.
 
-### vt10x for split-pane rendering
+### Tabs per server, sessions per user
 
-In split mode, each session writes to a virtual terminal (vt10x) instead of stdout. A render ticker composites all virtual terminals into a single frame, drawing separators between panes. This avoids interleaved output from concurrent sessions.
+A tab represents one server. Inside it, each SSH user (`irteam`, `irteamsu`)
+has at most one session, and only the active one is shown. `Ctrl+A u` switches
+between them without closing either shell. The server list shows chips for the
+users that have an open session on each host.
+
+### vt10x for every session
+
+Every session writes to a virtual terminal, not just split panes. vt10x gives
+each rune one cell, while the remote program counts CJK characters as two
+columns, so a filter inserts a padding rune after each double-width character
+before it reaches vt10x and the renderer skips it. The virtual terminal is
+also given the PTY as its writer so it can answer status queries (cursor
+position etc.) the way a real terminal would.
+
+### Split presets instead of free-form splits
+
+Layouts are fixed presets (single, left/right, top/bottom, main+stack, 2x2)
+cycled with `Ctrl+A Space`. A preset that needs more tabs than exist shrinks
+automatically. Zoom temporarily shows the focused pane full-size while keeping
+the layout, and broadcast sends typed input to every pane.
 
 ### Concurrent server fetching
 
