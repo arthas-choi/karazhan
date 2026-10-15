@@ -1,640 +1,662 @@
 package mux
 
 import (
-	"bytes"
 	"fmt"
-	"io"
-	"os"
-	"os/signal"
 	"sync"
-	"sync/atomic"
-	"syscall"
-	"time"
-
-	"golang.org/x/term"
 )
 
 const prefixKey = 0x01 // Ctrl+A
 
-// DetachReason indicates why the multiplexer returned control.
-type DetachReason int
+// Action tells the host UI what a key handled by the multiplexer asks for.
+type Action int
 
 const (
-	DetachNormal DetachReason = iota // Ctrl+A d
-	DetachNewTab                     // Ctrl+A c
-	DetachEmpty                      // All sessions closed
+	ActionNone       Action = iota
+	ActionFocusList         // Ctrl+A d, Ctrl+A ← at the left edge, last tab closed
+	ActionToggleList        // Ctrl+A e: collapse / expand the server list
 )
 
-// Manager manages multiple terminal sessions.
+// Manager manages server tabs, each holding one session per SSH user, and
+// renders them into a text frame the host UI places on screen. It does no
+// terminal I/O itself.
 type Manager struct {
 	mu        sync.Mutex
-	sessions  []*Session
-	activeIdx int
+	tabs      []*Tab
+	activeIdx int // focused tab
 	nextID    int
 	mock      bool
 
-	// Split state
-	split      SplitMode
-	splitPanes [2]int // session indices for pane 0 and pane 1
-	splitFocus int    // 0 or 1
+	// Split state. In split mode activeIdx is always panes[paneFocus].
+	split     SplitMode
+	panes     []int // tab index shown in each pane of the preset
+	paneFocus int
+	zoomed    bool // focused pane temporarily fills the area
+	broadcast bool // input goes to every pane of the preset
 
-	// Session death notification
-	deathCh chan int
+	// Size of the area the multiplexer draws in, tab bar included.
+	cols, rows int
 
-	LastDetach DetachReason
+	prefix    bool // Ctrl+A pressed, waiting for the command key
+	helpShown bool
+
+	// updates is signalled (coalesced) whenever a session's screen changes
+	// or a session ends.
+	updates chan struct{}
 }
-
-// Runner implements tea.ExecCommand for integration with Bubble Tea.
-type Runner struct {
-	Mgr    *Manager
-	stdin  io.Reader
-	stdout io.Writer
-	stderr io.Writer
-}
-
-func (r *Runner) Run() error               { return r.Mgr.Run() }
-func (r *Runner) SetStdin(in io.Reader)    { r.stdin = in }
-func (r *Runner) SetStdout(out io.Writer)  { r.stdout = out }
-func (r *Runner) SetStderr(errw io.Writer) { r.stderr = errw }
 
 func NewManager(mock bool) *Manager {
 	return &Manager{
 		mock:    mock,
-		deathCh: make(chan int, 16),
+		cols:    80,
+		rows:    24,
+		updates: make(chan struct{}, 1),
 	}
 }
 
-func (m *Manager) AddSession(name, user, ipOrHostName string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// Updates returns a channel that receives a value when the frame should be redrawn.
+func (m *Manager) Updates() <-chan struct{} {
+	return m.updates
+}
 
-	s, err := newSession(m.nextID, name, user, ipOrHostName, 80, 24, m.mock)
+func (m *Manager) notify() {
+	select {
+	case m.updates <- struct{}{}:
+	default:
+	}
+}
+
+// startSessionLocked opens a session and starts its output reader.
+// Caller must hold m.mu.
+func (m *Manager) startSessionLocked(name, user, host string) (*Session, error) {
+	cols, rows := m.contentSizeLocked()
+	s, err := newSession(m.nextID, name, user, host, cols, rows, m.mock)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	m.nextID++
-	m.sessions = append(m.sessions, s)
-	m.activeIdx = len(m.sessions) - 1
-	return nil
+	go m.readLoop(s)
+	return s, nil
 }
 
-func (m *Manager) SessionCount() int {
+// contentSizeLocked is the terminal size of a full-area session.
+func (m *Manager) contentSizeLocked() (cols, rows int) {
+	rows = m.rows - 1 // tab bar
+	if rows < 1 {
+		rows = 1
+	}
+	cols = m.cols
+	if cols < 1 {
+		cols = 1
+	}
+	return cols, rows
+}
+
+// OpenTab always opens a new tab for the server, connected as user.
+// A server that already has tabs gets a "#N" duplicate tab.
+func (m *Manager) OpenTab(name, host, user string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.sessions)
-}
 
-func (m *Manager) Runner() *Runner {
-	return &Runner{Mgr: m}
-}
-
-func (m *Manager) Run() error {
-	fd := int(os.Stdin.Fd())
-
-	oldState, err := term.MakeRaw(fd)
-	if err != nil {
-		return fmt.Errorf("failed to set raw mode: %w", err)
-	}
-	defer term.Restore(fd, oldState)
-
-	cols, rows, err := term.GetSize(fd)
+	s, err := m.startSessionLocked(name, user, host)
 	if err != nil {
 		return err
 	}
-
-	fmt.Fprint(os.Stdout, "\033[2J\033[H")
-	defer func() {
-		fmt.Fprint(os.Stdout, "\033[r")
-		fmt.Fprint(os.Stdout, "\033[2J\033[H")
-	}()
-
-	m.applyLayout(rows, cols)
-
-	// Handle SIGWINCH
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGWINCH)
-	defer signal.Stop(sigCh)
-
-	var running atomic.Bool
-	running.Store(true)
-
-	go func() {
-		for range sigCh {
-			if !running.Load() {
-				return
-			}
-			newCols, newRows, err := term.GetSize(fd)
-			if err != nil {
-				continue
-			}
-			cols, rows = newCols, newRows
-			m.applyLayout(rows, cols)
-		}
-	}()
-
-	// Output goroutines
-	for i := range m.sessions {
-		go m.relayOutput(i, &running)
-	}
-
-	// Render ticker for split mode (~10fps, non-blocking)
-	renderTick := time.NewTicker(100 * time.Millisecond)
-	defer renderTick.Stop()
-
-	go func() {
-		for range renderTick.C {
-			if !running.Load() {
-				return
-			}
-			// Snapshot split state without holding lock during render
-			m.mu.Lock()
-			isSplit := m.split != SplitNone
-			m.mu.Unlock()
-
-			if isSplit {
-				// renderSplit reads session data via Session.mu (not Manager.mu)
-				m.renderSplit(rows, cols)
-				m.drawTabBar(rows, cols)
-			}
-		}
-	}()
-
-	// Session death handler
-	go func() {
-		for range m.deathCh {
-			if !running.Load() {
-				return
-			}
-			m.handleSessionDeath(rows, cols, &running)
-		}
-	}()
-
-	if m.split == SplitNone {
-		m.switchToActive(rows, cols)
-	}
-
-	// Input loop: read in chunks (handles multi-byte sequences like ESC [ A)
-	inputBuf := make([]byte, 256)
-	prefixMode := false
-	helpShown := false
-
-	for running.Load() {
-		n, err := os.Stdin.Read(inputBuf)
-		if err != nil {
-			break
-		}
-
-		for i := 0; i < n; i++ {
-			b := inputBuf[i]
-
-			if helpShown {
-				helpShown = false
-				m.applyLayout(rows, cols)
-				continue
-			}
-
-			if prefixMode {
-				prefixMode = false
-
-				// Check for ESC [ X arrow sequence
-				if b == 0x1b && i+2 < n && inputBuf[i+1] == '[' {
-					m.handleArrow(inputBuf[i+2])
-					i += 2 // skip [ and direction byte
-					continue
-				}
-
-				m.handlePrefixKey(b, &running, &helpShown, rows, cols)
-				continue
-			}
-
-			if b == prefixKey {
-				prefixMode = true
-				continue
-			}
-
-			// Forward to focused session
-			m.writeToFocused(inputBuf[i : i+1])
+	dup := 1
+	for _, t := range m.tabs {
+		if t.Name == name && t.Dup >= dup {
+			dup = t.Dup + 1
 		}
 	}
-
+	t := &Tab{Name: name, Host: host, Dup: dup}
+	t.add(s)
+	m.tabs = append(m.tabs, t)
+	m.focusLocked(len(m.tabs) - 1)
+	m.relayoutLocked(false)
 	return nil
 }
 
-func (m *Manager) handleArrow(dir byte) {
-	if m.split == SplitNone {
+// FocusServer focuses the first tab open to the server, keeping its user.
+// Returns false if the server has no tab.
+func (m *Manager) FocusServer(name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, t := range m.tabs {
+		if t.Name == name {
+			m.focusLocked(i)
+			m.relayoutLocked(false)
+			return true
+		}
+	}
+	return false
+}
+
+// SwitchUser shows the focused tab's session for user, opening a new SSH
+// session to the same server if the tab has none for that user yet.
+func (m *Manager) SwitchUser(user string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.switchUserLocked(user)
+}
+
+func (m *Manager) switchUserLocked(user string) error {
+	t := m.focusedTabLocked()
+	if t == nil {
+		return fmt.Errorf("no tab")
+	}
+	if !t.activate(user) {
+		s, err := m.startSessionLocked(t.Name, user, t.Host)
+		if err != nil {
+			return err
+		}
+		t.add(s)
+	}
+	m.relayoutLocked(false)
+	return nil
+}
+
+// OpenUsers maps each server with an open tab to the users connected to it.
+func (m *Manager) OpenUsers() map[string][]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string][]string)
+	for _, t := range m.tabs {
+		for _, u := range t.Users() {
+			if !containsString(out[t.Name], u) {
+				out[t.Name] = append(out[t.Name], u)
+			}
+		}
+	}
+	return out
+}
+
+func (m *Manager) TabCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.tabs)
+}
+
+// SetSize sets the drawing area (tab bar included) and resizes sessions.
+func (m *Manager) SetSize(cols, rows int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cols == m.cols && rows == m.rows {
 		return
 	}
-	switch dir {
-	case 'A', 'B': // Up/Down
-		if m.split == SplitHorizontal {
-			m.splitFocus = 1 - m.splitFocus
-			m.mu.Lock()
-			m.activeIdx = m.splitPanes[m.splitFocus]
-			m.mu.Unlock()
+	m.cols, m.rows = cols, rows
+	m.relayoutLocked(false)
+}
+
+// AppCursor reports whether the focused program wants application-mode arrow keys.
+func (m *Manager) AppCursor() bool {
+	m.mu.Lock()
+	s := m.tabSessionLocked(m.activeIdx)
+	m.mu.Unlock()
+	return s != nil && s.AppCursor()
+}
+
+// focusLocked makes tab idx the focused tab. In split mode the tab is shown
+// in the focused pane; if another pane already shows it, the two swap.
+func (m *Manager) focusLocked(idx int) {
+	if m.split != SplitNone && m.paneFocus < len(m.panes) {
+		for i, t := range m.panes {
+			if t == idx && i != m.paneFocus {
+				m.panes[i] = m.panes[m.paneFocus]
+			}
 		}
-	case 'C', 'D': // Right/Left
-		if m.split == SplitVertical {
-			m.splitFocus = 1 - m.splitFocus
-			m.mu.Lock()
-			m.activeIdx = m.splitPanes[m.splitFocus]
-			m.mu.Unlock()
+		m.panes[m.paneFocus] = idx
+	}
+	m.activeIdx = idx
+}
+
+func (m *Manager) focusedTabLocked() *Tab {
+	if m.activeIdx < 0 || m.activeIdx >= len(m.tabs) {
+		return nil
+	}
+	return m.tabs[m.activeIdx]
+}
+
+// tabSessionLocked returns the session shown by tab idx, or nil.
+func (m *Manager) tabSessionLocked(idx int) *Session {
+	if idx < 0 || idx >= len(m.tabs) {
+		return nil
+	}
+	return m.tabs[idx].Current()
+}
+
+// singleLocked reports whether one tab fills the area (no split, or zoomed).
+func (m *Manager) singleLocked() bool {
+	return m.split == SplitNone || m.zoomed
+}
+
+// smallerPreset is the fallback when there are too few tabs for a preset.
+func smallerPreset(s SplitMode) SplitMode {
+	switch s {
+	case SplitGrid:
+		return SplitMainStack
+	case SplitMainStack:
+		return SplitVertical
+	default:
+		return SplitNone
+	}
+}
+
+// fillPanesLocked makes panes match the preset: the focused tab stays in the
+// focused pane, other panes keep their tab when still valid, and empty panes
+// take tabs that are not shown yet. Presets that need more tabs than exist
+// shrink. Returns true if the preset changed.
+func (m *Manager) fillPanesLocked() bool {
+	before := m.split
+	for m.split != SplitNone && m.split.PaneCount() > len(m.tabs) {
+		m.split = smallerPreset(m.split)
+	}
+	if m.split == SplitNone {
+		m.panes = nil
+		m.paneFocus = 0
+		m.zoomed = false
+		m.broadcast = false
+		return before != m.split
+	}
+
+	n := m.split.PaneCount()
+	if m.paneFocus >= n {
+		m.paneFocus = 0
+	}
+	out := make([]int, n)
+	used := make(map[int]bool)
+	for i := range out {
+		out[i] = -1
+	}
+	if m.activeIdx >= 0 && m.activeIdx < len(m.tabs) {
+		out[m.paneFocus] = m.activeIdx
+		used[m.activeIdx] = true
+	}
+	for i := range out {
+		if out[i] == -1 && i < len(m.panes) {
+			if t := m.panes[i]; t >= 0 && t < len(m.tabs) && !used[t] {
+				out[i] = t
+				used[t] = true
+			}
+		}
+	}
+	for i := range out {
+		if out[i] != -1 {
+			continue
+		}
+		for t := range m.tabs {
+			if !used[t] {
+				out[i] = t
+				used[t] = true
+				break
+			}
+		}
+	}
+	m.panes = out
+	m.activeIdx = out[m.paneFocus]
+	return before != m.split
+}
+
+// setPresetLocked switches the pane layout. The focused tab moves to the first pane.
+func (m *Manager) setPresetLocked(p SplitMode) {
+	if p.PaneCount() > len(m.tabs) || p == m.split {
+		return
+	}
+	m.split = p
+	m.paneFocus = 0
+	m.zoomed = false
+	m.fillPanesLocked()
+	m.relayoutLocked(true)
+}
+
+// paneLayoutLocked computes the pane layout below the tab bar (row 1 is the
+// tab bar, so pane rows are shifted down by one).
+func (m *Manager) paneLayoutLocked() ([]Pane, []Separator) {
+	split := m.split
+	if m.zoomed {
+		split = SplitNone
+	}
+	panes, seps := Layout(split, m.paneFocus, m.panes, m.cols, m.rows)
+	if split == SplitNone {
+		panes[0].TabIdx = m.activeIdx
+	}
+	for i := range panes {
+		panes[i].Row++
+	}
+	for i := range seps {
+		seps[i].Row++
+	}
+	return panes, seps
+}
+
+// relayoutLocked resizes sessions to the panes they are shown in. clearVT
+// drops their screen content (used when the layout itself changes, where
+// old content at the old size would be garbled).
+func (m *Manager) relayoutLocked(clearVT bool) {
+	resize := func(s *Session, rows, cols int) {
+		if clearVT {
+			s.ResizeWithClear(uint16(rows), uint16(cols))
+		} else {
+			s.Resize(uint16(rows), uint16(cols))
+		}
+	}
+	if m.split == SplitNone {
+		cols, rows := m.contentSizeLocked()
+		for _, t := range m.tabs {
+			for _, s := range t.sessions {
+				resize(s, rows, cols)
+			}
+		}
+		return
+	}
+	panes, _ := m.paneLayoutLocked()
+	for _, p := range panes {
+		if p.TabIdx < 0 || p.TabIdx >= len(m.tabs) {
+			continue
+		}
+		// Size every user session of the pane's tab, so switching user keeps the layout.
+		for _, s := range m.tabs[p.TabIdx].sessions {
+			if m.zoomed {
+				// Zoom is a quick look: keep content, only resize.
+				s.Resize(uint16(p.Height), uint16(p.Width))
+			} else {
+				resize(s, p.Height, p.Width)
+			}
 		}
 	}
 }
 
-func (m *Manager) handlePrefixKey(b byte, running *atomic.Bool, helpShown *bool, rows, cols int) {
-	switch b {
-	case 'd', 'D':
-		m.LastDetach = DetachNormal
-		running.Store(false)
-	case 'c', 'C':
-		m.LastDetach = DetachNewTab
-		running.Store(false)
-	case 'x', 'X':
-		m.closeFocused()
-		if len(m.sessions) == 0 {
-			m.LastDetach = DetachEmpty
-			running.Store(false)
+// readLoop pumps a session's PTY output into its VT buffer for the session's
+// whole lifetime and asks for a redraw.
+func (m *Manager) readLoop(s *Session) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := s.Read(buf)
+		if n > 0 {
+			s.WriteToVT(buf[:n])
+			m.notify()
+		}
+		if err != nil {
+			s.markDone()
+			m.notify()
 			return
 		}
-		if m.split != SplitNone && len(m.sessions) < 2 {
-			m.split = SplitNone
-		}
-		m.applyLayout(rows, cols)
-	case 'n', ']':
-		m.mu.Lock()
-		m.activeIdx = (m.activeIdx + 1) % len(m.sessions)
-		if m.split != SplitNone {
-			m.splitPanes[m.splitFocus] = m.activeIdx
-		}
-		m.mu.Unlock()
-		if m.split == SplitNone {
-			m.applyLayout(rows, cols)
-		}
-	case 'p', '[':
-		m.mu.Lock()
-		m.activeIdx = (m.activeIdx - 1 + len(m.sessions)) % len(m.sessions)
-		if m.split != SplitNone {
-			m.splitPanes[m.splitFocus] = m.activeIdx
-		}
-		m.mu.Unlock()
-		if m.split == SplitNone {
-			m.applyLayout(rows, cols)
-		}
+	}
+}
 
-	// Split commands
-	case '-':
-		m.enterSplit(SplitHorizontal, rows, cols)
-	case '|', '\\':
-		m.enterSplit(SplitVertical, rows, cols)
-	case 'z', 'Z':
-		if m.split != SplitNone {
-			m.split = SplitNone
-			fmt.Fprint(os.Stdout, "\033[2J\033[H")
-			m.applyLayoutWithClear(rows, cols)
+// HandleInput processes one key's bytes typed while the terminal area has
+// focus: Ctrl+A commands, or input forwarded to the focused session (or to
+// every pane while broadcasting).
+func (m *Manager) HandleInput(data []byte) Action {
+	if len(data) == 0 {
+		return ActionNone
+	}
+	m.mu.Lock()
+	if m.helpShown {
+		m.helpShown = false
+		m.mu.Unlock()
+		return ActionNone
+	}
+	if m.prefix {
+		m.prefix = false
+		defer m.mu.Unlock()
+		// Arrow keys: ESC [ X, ESC O X, or ESC [ 1 ; mod X
+		if len(data) >= 3 && data[0] == 0x1b && (data[1] == '[' || data[1] == 'O') {
+			return m.handleArrowLocked(data[len(data)-1])
 		}
+		return m.handlePrefixKeyLocked(data[0])
+	}
+	if len(data) == 1 && data[0] == prefixKey {
+		m.prefix = true
+		m.mu.Unlock()
+		return ActionNone
+	}
+	m.mu.Unlock()
+	m.writeInput(data)
+	return ActionNone
+}
 
-	// Focus switch
-	case '\t':
-		if m.split != SplitNone {
-			m.splitFocus = 1 - m.splitFocus
-			m.mu.Lock()
-			m.activeIdx = m.splitPanes[m.splitFocus]
-			m.mu.Unlock()
+// handleArrowLocked moves pane focus in the arrow's direction; going left
+// from the leftmost pane hands focus to the server list.
+func (m *Manager) handleArrowLocked(dir byte) Action {
+	if m.singleLocked() {
+		if dir == 'D' {
+			return ActionFocusList
 		}
+		return ActionNone
+	}
+	panes, _ := m.paneLayoutLocked()
+	next := neighbor(panes, m.paneFocus, dir)
+	if next == m.paneFocus && dir == 'D' {
+		return ActionFocusList
+	}
+	m.focusPaneLocked(next)
+	return ActionNone
+}
+
+func (m *Manager) focusPaneLocked(i int) {
+	if i < 0 || i >= len(m.panes) {
+		return
+	}
+	m.paneFocus = i
+	m.activeIdx = m.panes[i]
+}
+
+func (m *Manager) handlePrefixKeyLocked(b byte) Action {
+	switch b {
+	case 'd', 'D':
+		return ActionFocusList
+	case 'e', 'E':
+		return ActionToggleList
+
+	case 'c', 'C':
+		// Duplicate the focused tab: new tab to the same server as the same user.
+		t := m.focusedTabLocked()
+		if t == nil {
+			return ActionNone
+		}
+		name, host, user := t.Name, t.Host, t.CurrentUser()
+		m.mu.Unlock()
+		_ = m.OpenTab(name, host, user)
+		m.mu.Lock()
 
 	case 'u', 'U':
-		m.mu.Lock()
-		if m.activeIdx >= 0 && m.activeIdx < len(m.sessions) {
-			cur := m.sessions[m.activeIdx]
-			newUser := "irteamsu"
-			if cur.User == "irteamsu" {
-				newUser = "irteam"
-			}
-			name := cur.Name
-			ip := cur.IP
-			// Check if session with same server+user already exists
-			existingIdx := -1
-			for i, s := range m.sessions {
-				if s.Name == name && s.User == newUser && !s.IsDone() {
-					existingIdx = i
-					break
-				}
-			}
-			if existingIdx >= 0 {
-				// Switch to existing session
-				m.activeIdx = existingIdx
-				if m.split != SplitNone {
-					m.splitPanes[m.splitFocus] = existingIdx
-				}
-				m.mu.Unlock()
-				m.applyLayout(rows, cols)
-			} else {
-				m.mu.Unlock()
-				if err := m.AddSession(name, newUser, ip); err == nil {
-					m.applyLayout(rows, cols)
-				}
-			}
-		} else {
-			m.mu.Unlock()
+		// Switch the focused tab between irteam and irteamsu. Both sessions
+		// stay open, so switching back returns to the same shell.
+		if t := m.focusedTabLocked(); t != nil {
+			_ = m.switchUserLocked(otherUser(t.CurrentUser()))
+		}
+
+	case 'x', 'X':
+		// Close the focused tab's current user session; the tab closes with its last session.
+		shrank := m.closeFocusedLocked()
+		if len(m.tabs) == 0 {
+			return ActionFocusList
+		}
+		m.relayoutLocked(shrank)
+
+	case 'n', ']':
+		if len(m.tabs) > 0 {
+			m.focusLocked((m.activeIdx + 1) % len(m.tabs))
+			m.relayoutLocked(false)
+		}
+	case 'p', '[':
+		if len(m.tabs) > 0 {
+			m.focusLocked((m.activeIdx - 1 + len(m.tabs)) % len(m.tabs))
+			m.relayoutLocked(false)
+		}
+
+	// Split presets
+	case ' ':
+		m.setPresetLocked(nextPreset(m.split, len(m.tabs)))
+	case '-':
+		m.setPresetLocked(SplitHorizontal)
+	case '|', '\\':
+		m.setPresetLocked(SplitVertical)
+	case '!':
+		m.setPresetLocked(SplitNone)
+
+	case 'z', 'Z':
+		// Toggle zoom: the focused pane fills the area, the layout is kept.
+		if m.split != SplitNone {
+			m.zoomed = !m.zoomed
+			m.relayoutLocked(false)
+		}
+
+	case 'b', 'B':
+		// Toggle broadcast: typed input goes to every pane of the layout.
+		if m.split != SplitNone {
+			m.broadcast = !m.broadcast
+		}
+
+	case '\t':
+		if m.split != SplitNone && !m.zoomed && len(m.panes) > 0 {
+			m.focusPaneLocked((m.paneFocus + 1) % len(m.panes))
 		}
 
 	case '?':
-		*helpShown = true
-		m.drawHelp(rows-1, cols)
+		m.helpShown = true
 
 	case prefixKey:
-		m.writeToFocused([]byte{prefixKey})
+		m.mu.Unlock()
+		m.writeInput([]byte{prefixKey})
+		m.mu.Lock()
 
 	default:
 		if b >= '1' && b <= '9' {
-			idx := int(b - '1')
-			m.mu.Lock()
-			if idx < len(m.sessions) {
-				m.activeIdx = idx
-				if m.split != SplitNone {
-					m.splitPanes[m.splitFocus] = idx
-				}
-			}
-			m.mu.Unlock()
-			if m.split == SplitNone {
-				m.applyLayout(rows, cols)
+			if idx := int(b - '1'); idx < len(m.tabs) {
+				m.focusLocked(idx)
+				m.relayoutLocked(false)
 			}
 		}
 	}
+	return ActionNone
 }
 
-func (m *Manager) handleSessionDeath(rows, cols int, running *atomic.Bool) {
-	m.mu.Lock()
-
-	// Remove dead sessions
-	var alive []*Session
-	for _, s := range m.sessions {
-		if s.IsDone() {
-			s.Close()
-		} else {
-			alive = append(alive, s)
-		}
-	}
-	m.sessions = alive
-
-	if len(m.sessions) == 0 {
-		m.mu.Unlock()
-		m.LastDetach = DetachEmpty
-		running.Store(false)
-		return
-	}
-
-	// Fix indices
-	if m.activeIdx >= len(m.sessions) {
-		m.activeIdx = len(m.sessions) - 1
-	}
-	for i := range m.splitPanes {
-		if m.splitPanes[i] >= len(m.sessions) {
-			m.splitPanes[i] = len(m.sessions) - 1
-		}
-	}
-	if m.split != SplitNone && len(m.sessions) < 2 {
-		m.split = SplitNone
-	}
-	m.mu.Unlock()
-
-	m.applyLayout(rows, cols)
-}
-
-func (m *Manager) enterSplit(mode SplitMode, rows, cols int) {
-	m.mu.Lock()
-	if len(m.sessions) < 2 {
-		m.mu.Unlock()
-		return
-	}
-	m.split = mode
-	m.splitFocus = 0
-	m.splitPanes[0] = m.activeIdx
-	m.splitPanes[1] = (m.activeIdx + 1) % len(m.sessions)
-	m.mu.Unlock()
-	fmt.Fprint(os.Stdout, "\033[2J\033[H")
-	m.applyLayoutWithClear(rows, cols)
-}
-
-func (m *Manager) applyLayout(rows, cols int) {
-	m.applyLayoutInner(rows, cols, false)
-}
-
-func (m *Manager) applyLayoutWithClear(rows, cols int) {
-	m.applyLayoutInner(rows, cols, true)
-}
-
-func (m *Manager) applyLayoutInner(rows, cols int, clearVT bool) {
-	if m.split == SplitNone {
-		fmt.Fprintf(os.Stdout, "\033[1;%dr", rows-1)
-		if clearVT {
-			m.resizeAllWithClear(uint16(rows-1), uint16(cols))
-		} else {
-			m.resizeAll(uint16(rows-1), uint16(cols))
-		}
-		m.drawTabBar(rows, cols)
-		m.switchToActive(rows, cols)
-	} else {
-		fmt.Fprint(os.Stdout, "\033[r")
-		panes := Layout(m.split, m.splitFocus, m.splitPanes[0], m.splitPanes[1], cols, rows)
-		m.mu.Lock()
-		for _, p := range panes {
-			if p.SessionIdx >= 0 && p.SessionIdx < len(m.sessions) {
-				if clearVT {
-					m.sessions[p.SessionIdx].ResizeWithClear(uint16(p.Height), uint16(p.Width))
-				} else {
-					m.sessions[p.SessionIdx].Resize(uint16(p.Height), uint16(p.Width))
-				}
-			}
-		}
-		m.mu.Unlock()
-		m.drawTabBar(rows, cols)
-	}
-}
-
-// relayOutput reads from session PTY and routes to VT + stdout.
-func (m *Manager) relayOutput(idx int, running *atomic.Bool) {
-	buf := make([]byte, 4096)
-	s := m.sessions[idx]
-	for running.Load() {
-		n, err := s.Read(buf)
-		if err != nil {
-			// Session died → notify main loop
-			select {
-			case m.deathCh <- idx:
-			default:
-			}
-			return
-		}
-
-		data := buf[:n]
-		s.WriteToVT(data)
-
-		m.mu.Lock()
-		isSplit := m.split != SplitNone
-		isActive := m.activeIdx == idx
-		m.mu.Unlock()
-
-		if !isSplit && isActive {
-			os.Stdout.Write(data)
-		}
-	}
-}
-
-func (m *Manager) writeToFocused(data []byte) {
-	m.mu.Lock()
-	var idx int
-	if m.split != SplitNone {
-		idx = m.splitPanes[m.splitFocus]
-	} else {
-		idx = m.activeIdx
-	}
-	if idx >= 0 && idx < len(m.sessions) && !m.sessions[idx].IsDone() {
-		s := m.sessions[idx]
-		m.mu.Unlock()
-		s.Write(data)
-		return
-	}
-	m.mu.Unlock()
-}
-
-func (m *Manager) switchToActive(rows, cols int) {
-	m.mu.Lock()
-	if m.activeIdx >= 0 && m.activeIdx < len(m.sessions) {
-		s := m.sessions[m.activeIdx]
-		idx := m.activeIdx
-		m.mu.Unlock()
-		fmt.Fprintf(os.Stdout, "\033[2J\033[H")
-		s.Resize(uint16(rows-1), uint16(cols))
-		m.drawTabBar(rows, cols)
-		// Render current VT buffer content to screen immediately
-		// so the user doesn't see a blank screen until new data arrives.
-		m.renderActiveFromVT(idx, rows, cols)
-		return
-	}
-	m.mu.Unlock()
-}
-
-// renderActiveFromVT draws the VT buffer of the active session to stdout.
-func (m *Manager) renderActiveFromVT(idx int, rows, cols int) {
-	m.mu.Lock()
-	if idx < 0 || idx >= len(m.sessions) {
-		m.mu.Unlock()
-		return
-	}
-	s := m.sessions[idx]
-	m.mu.Unlock()
-
-	vtCols, vtRows := s.VTSize()
-	usable := rows - 1
-	if usable > vtRows {
-		usable = vtRows
-	}
-	renderW := cols
-	if renderW > vtCols {
-		renderW = vtCols
-	}
-
-	var buf bytes.Buffer
-	buf.Grow(usable * renderW * 3)
-	buf.WriteString("\033[?25l")
-	buf.WriteString("\033[H")
-
-	for row := 0; row < usable; row++ {
-		fmt.Fprintf(&buf, "\033[%d;1H", row+1)
-		for col := 0; col < renderW; col++ {
-			cell := s.CellAt(col, row)
-			ch := cell.Char
-			if ch == 0 {
-				ch = ' '
-			}
-			buf.WriteRune(ch)
-		}
-	}
-
-	// Restore cursor position
-	curCol, curRow := s.CursorPos()
-	if curRow < usable && curCol < renderW {
-		fmt.Fprintf(&buf, "\033[%d;%dH", curRow+1, curCol+1)
-	}
-	buf.WriteString("\033[?25h")
-
-	os.Stdout.Write(buf.Bytes())
-}
-
-func (m *Manager) resizeAll(rows, cols uint16) {
+// Prune drops finished sessions and the tabs they leave empty.
+func (m *Manager) Prune() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, s := range m.sessions {
-		s.Resize(rows, cols)
+	if m.pruneDoneLocked() {
+		m.relayoutLocked(true)
 	}
 }
 
-func (m *Manager) resizeAllWithClear(rows, cols uint16) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, s := range m.sessions {
-		s.ResizeWithClear(rows, cols)
+// pruneDoneLocked drops finished sessions and the tabs they leave empty.
+// Returns true if the split preset shrank as a result.
+func (m *Manager) pruneDoneLocked() bool {
+	changed := false
+	for i := len(m.tabs) - 1; i >= 0; i-- {
+		t := m.tabs[i]
+		for _, s := range append([]*Session(nil), t.sessions...) {
+			if s.IsDone() {
+				s.Close()
+				t.remove(s)
+			}
+		}
+		if len(t.sessions) == 0 {
+			if m.removeTabLocked(i) {
+				changed = true
+			}
+		}
 	}
+	return changed
 }
 
-func (m *Manager) closeFocused() {
+// removeTabLocked removes tab idx, shifts the tab indices that follow it
+// and refills the panes. Returns true if the split preset shrank.
+func (m *Manager) removeTabLocked(idx int) bool {
+	m.tabs = append(m.tabs[:idx], m.tabs[idx+1:]...)
+	fix := func(i int) int {
+		switch {
+		case i == idx:
+			return -1
+		case i > idx:
+			return i - 1
+		}
+		return i
+	}
+	for p := range m.panes {
+		m.panes[p] = fix(m.panes[p])
+	}
+	m.activeIdx = fix(m.activeIdx)
+	if m.activeIdx < 0 || m.activeIdx >= len(m.tabs) {
+		// The focused tab closed: focus its neighbour.
+		m.activeIdx = idx
+		if m.activeIdx >= len(m.tabs) {
+			m.activeIdx = len(m.tabs) - 1
+		}
+		if m.activeIdx < 0 {
+			m.activeIdx = 0
+		}
+		// Keep an already visible tab where it is instead of swapping it in.
+		for p, t := range m.panes {
+			if t == m.activeIdx && p != m.paneFocus && m.paneFocus < len(m.panes) && m.panes[m.paneFocus] == -1 {
+				m.paneFocus = p
+			}
+		}
+	}
+	return m.fillPanesLocked()
+}
+
+// writeInput sends typed input to the focused session, or to the shown
+// session of every pane while broadcasting.
+func (m *Manager) writeInput(data []byte) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var idx int
-	if m.split != SplitNone {
-		idx = m.splitPanes[m.splitFocus]
-	} else {
-		idx = m.activeIdx
+	var targets []*Session
+	if m.broadcast && m.split != SplitNone {
+		for _, idx := range m.panes {
+			if s := m.tabSessionLocked(idx); s != nil {
+				targets = append(targets, s)
+			}
+		}
+	} else if s := m.tabSessionLocked(m.activeIdx); s != nil {
+		targets = append(targets, s)
 	}
-
-	if idx >= len(m.sessions) {
-		return
-	}
-	s := m.sessions[idx]
-	s.Close()
-	m.sessions = append(m.sessions[:idx], m.sessions[idx+1:]...)
-
-	if m.activeIdx >= len(m.sessions) && len(m.sessions) > 0 {
-		m.activeIdx = len(m.sessions) - 1
-	}
-	for i := range m.splitPanes {
-		if m.splitPanes[i] >= len(m.sessions) && len(m.sessions) > 0 {
-			m.splitPanes[i] = len(m.sessions) - 1
+	m.mu.Unlock()
+	for _, s := range targets {
+		if !s.IsDone() {
+			s.Write(data)
 		}
 	}
 }
 
-// CleanDone removes finished sessions.
-func (m *Manager) CleanDone() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var alive []*Session
-	for _, s := range m.sessions {
-		if s.IsDone() {
-			s.Close()
-		} else {
-			alive = append(alive, s)
-		}
+// closeFocusedLocked closes the focused tab's current session, and the tab if
+// it was the last one. Returns true if the split preset shrank.
+func (m *Manager) closeFocusedLocked() bool {
+	t := m.focusedTabLocked()
+	if t == nil {
+		return false
 	}
-	m.sessions = alive
-	if m.activeIdx >= len(m.sessions) && len(m.sessions) > 0 {
-		m.activeIdx = len(m.sessions) - 1
+	if s := t.Current(); s != nil {
+		s.Close()
+		t.remove(s)
 	}
-	if m.split != SplitNone && len(m.sessions) < 2 {
-		m.split = SplitNone
+	if len(t.sessions) == 0 {
+		return m.removeTabLocked(m.activeIdx)
 	}
+	return false
 }
 
 // CloseAll terminates all sessions.
 func (m *Manager) CloseAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, s := range m.sessions {
-		s.Close()
+	for _, t := range m.tabs {
+		for _, s := range t.sessions {
+			s.Close()
+		}
 	}
-	m.sessions = nil
+	m.tabs = nil
 	m.split = SplitNone
+	m.panes = nil
+	m.zoomed = false
+	m.broadcast = false
+}
+
+func containsString(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }

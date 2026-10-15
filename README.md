@@ -97,40 +97,45 @@ karazhan config show    # Display current config
 | Key | Action |
 |-----|--------|
 | `j` / `k` | Navigate up/down |
-| `Enter` | Expand group or select server |
-| `Tab` | Switch view mode (ESM / Group / Prefix) |
+| `Enter` / `l` | Expand group, or connect (focus the server's tab, or open one as the default user, `irteam` unless `default_user` is set) |
+| `h` | Collapse group |
+| `s` | Connect as `irteamsu` (switches the server's tab if already open) |
+| `o` | Always open a new tab as the default user |
+| `b` | Toggle bookmark |
+| `B` | Clear all bookmarks |
+| `Tab` | Switch view mode |
 | `r` | Refresh server list |
-| `m` | Attach to existing sessions |
+| `m` / `Esc` | Focus the terminal area (when tabs are open) |
+| `Ctrl+A l` / `d` | Focus the terminal area |
+| `Ctrl+A e` | Hide the list and focus the terminal area |
 | `/` | Search |
 | `q` | Quit |
 
-### User Selection
-
-After selecting a server, choose the SSH user:
-
-| Key | Action |
-|-----|--------|
-| `1` | Connect as `irteam` |
-| `2` | Connect as `irteamsu` |
-| `Esc` | Back to server list |
-
 ### Multiplexer
 
+The server list and terminal area share the screen. Each tab is one server;
+a tab keeps one session per SSH user (`irteam`, `irteamsu`).
 All multiplexer commands use the `Ctrl+A` prefix (like tmux).
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+A d` | Detach (back to server list) |
-| `Ctrl+A c` | New tab |
-| `Ctrl+A x` | Close current tab/pane |
+| `Ctrl+A d` | Focus the server list |
+| `Ctrl+A e` | Show/hide the server list |
+| `Ctrl+A c` | Duplicate tab (same server, same user) |
+| `Ctrl+A u` | Switch the tab between `irteam` and `irteamsu` |
+| `Ctrl+A x` | Close the current user session (tab closes with its last session) |
 | `Ctrl+A n` / `]` | Next tab |
 | `Ctrl+A p` / `[` | Previous tab |
 | `Ctrl+A 1-9` | Switch to tab N |
+| `Ctrl+A Space` | Cycle split presets |
 | `Ctrl+A -` | Split horizontal |
 | `Ctrl+A \|` | Split vertical |
-| `Ctrl+A Tab` | Switch focus between panes |
-| `Ctrl+A Arrow` | Switch focus (directional) |
-| `Ctrl+A z` | Zoom (unsplit) |
+| `Ctrl+A !` | Unsplit |
+| `Ctrl+A Tab` | Next pane |
+| `Ctrl+A Arrow` | Focus pane (directional) |
+| `Ctrl+A z` | Zoom focused pane |
+| `Ctrl+A b` | Broadcast input to all panes |
+| `Ctrl+A Ctrl+A` | Send a literal `Ctrl+A` |
 | `Ctrl+A ?` | Show help |
 
 ## Prerequisites

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"Karazhan/internal/auth"
@@ -10,6 +11,7 @@ import (
 	"Karazhan/internal/server"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const kerberosCheckInterval = 30 * time.Minute
@@ -19,8 +21,18 @@ type screen int
 const (
 	screenLogin screen = iota
 	screenServers
-	screenUserSelect
 )
+
+// focusArea is the part of the split screen that receives keys.
+type focusArea int
+
+const (
+	focusList focusArea = iota
+	focusTerm
+)
+
+// frameInterval coalesces bursts of terminal output into one redraw.
+const frameInterval = 16 * time.Millisecond
 
 type appModel struct {
 	cfg       *config.Config
@@ -34,8 +46,9 @@ type appModel struct {
 	serverList serverListModel
 	muxMgr     *mux.Manager
 
-	selectedServer *server.CIServer
-	sshUser        string
+	focus         focusArea
+	listCollapsed bool // Ctrl+A e: terminal takes the whole width
+	listPrefix    bool // Ctrl+A pressed while the list has focus
 }
 
 func NewApp(cfg *config.Config) appModel {
@@ -58,11 +71,13 @@ func (m appModel) Init() tea.Cmd {
 				return kerberosCheckedMsg{status: auth.KerberosStatus{Authenticated: false}}
 			},
 			tea.WindowSize(),
+			waitTermUpdate(m.muxMgr),
 		)
 	}
 	return tea.Batch(
 		checkKerberos(),
 		tea.WindowSize(),
+		waitTermUpdate(m.muxMgr),
 	)
 }
 
@@ -83,20 +98,90 @@ func scheduleKerberosCheck() tea.Cmd {
 	})
 }
 
-// --- Mux messages ---
+// --- Terminal messages ---
 
-type muxDoneMsg struct{}
+// termUpdateMsg means a session's screen changed or a session ended.
+type termUpdateMsg struct{}
+
+func waitTermUpdate(mgr *mux.Manager) tea.Cmd {
+	return func() tea.Msg {
+		<-mgr.Updates()
+		time.Sleep(frameInterval)
+		return termUpdateMsg{}
+	}
+}
+
+// --- Layout ---
+
+// listWidth is the server list panel width (0 when collapsed).
+func (m appModel) listWidth() int {
+	if m.listCollapsed && m.muxMgr.TabCount() > 0 {
+		return 0
+	}
+	w := m.width * 32 / 100
+	if w < 34 {
+		w = 34
+	}
+	if w > 60 {
+		w = 60
+	}
+	if m.width-w-1 < 40 {
+		w = m.width / 2
+	}
+	return w
+}
+
+// bodyHeight is the height between the status bar and the help line.
+func (m appModel) bodyHeight() int {
+	if h := m.height - 2; h > 3 {
+		return h
+	}
+	return 3
+}
+
+// termWidth is the width of the terminal area right of the list.
+func (m appModel) termWidth() int {
+	lw := m.listWidth()
+	if lw == 0 {
+		return max(m.width, 10)
+	}
+	return max(m.width-lw-1, 10)
+}
 
 // --- Update ---
 
 func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	if nm, ok := next.(appModel); ok {
+		if nm.muxMgr.TabCount() == 0 {
+			nm.focus = focusList
+			nm.listCollapsed = false
+		}
+		nm.muxMgr.SetSize(nm.termWidth(), nm.bodyHeight())
+		return nm, cmd
+	}
+	return next, cmd
+}
+
+func (m appModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		return m, nil
 
+	case termUpdateMsg:
+		m.muxMgr.Prune()
+		return m, waitTermUpdate(m.muxMgr)
+
 	case tea.KeyMsg:
+		if m.screen == screenServers && m.focus == focusTerm {
+			return m.handleTermKey(msg)
+		}
+		if m.screen == screenServers && m.listPrefix {
+			m.listPrefix = false
+			return m.handleListPrefix(msg)
+		}
 		// Let search mode handle its own keys first
 		if m.screen == screenServers && m.serverList.searching {
 			var searchCmd tea.Cmd
@@ -107,6 +192,11 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			m.muxMgr.CloseAll()
 			return m, tea.Quit
+		case "ctrl+a":
+			if m.screen == screenServers {
+				m.listPrefix = true
+				return m, nil
+			}
 		case "q":
 			if m.screen == screenServers {
 				if m.serverList.filter != "" {
@@ -117,12 +207,8 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 		case "esc":
-			switch m.screen {
-			case screenServers:
-				// Let serverList.Update handle esc for clearing filter
-				break
-			case screenUserSelect:
-				m.screen = screenServers
+			if m.screen == screenServers && m.serverList.filter == "" && m.muxMgr.TabCount() > 0 {
+				m.focus = focusTerm
 				return m, nil
 			}
 		}
@@ -158,12 +244,6 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.krbOk = true
 		m.screen = screenServers
 		return m, tea.Batch(m.loadServers(), scheduleKerberosCheck())
-
-	case muxDoneMsg:
-		// Returned from multiplexer
-		m.muxMgr.CleanDone()
-		m.screen = screenServers
-		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -181,38 +261,50 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.serverList.loading = true
 					return m, tea.Batch(m.refreshServers(), m.serverList.spinner.Tick)
 				case "m":
-					// Re-enter multiplexer if sessions exist
-					if m.muxMgr.SessionCount() > 0 {
-						return m, m.enterMux()
+					if m.muxMgr.TabCount() > 0 {
+						m.focus = focusTerm
+						return m, nil
 					}
 				}
 			}
 		case serverSelectedMsg:
-			m.selectedServer = &msg.server
-			m.screen = screenUserSelect
-			return m, nil
+			connectCmd := m.connectSSH(msg.server, msg.mode)
+			return m, connectCmd
 		}
 
 		m.serverList, cmd = m.serverList.Update(msg)
 		return m, cmd
-
-	case screenUserSelect:
-		switch msg := msg.(type) {
-		case tea.KeyMsg:
-			switch msg.String() {
-			case "1":
-				m.sshUser = "irteam"
-				return m, m.connectSSH()
-			case "2":
-				m.sshUser = "irteamsu"
-				return m, m.connectSSH()
-			case "q":
-				m.screen = screenServers
-				return m, nil
-			}
-		}
 	}
 
+	return m, nil
+}
+
+// handleTermKey forwards a key to the multiplexer while the terminal area
+// has focus; Ctrl+A commands may hand focus back to the list.
+func (m appModel) handleTermKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	data := keyToBytes(msg, m.muxMgr.AppCursor())
+	switch m.muxMgr.HandleInput(data) {
+	case mux.ActionFocusList:
+		m.focus = focusList
+		m.listCollapsed = false
+	case mux.ActionToggleList:
+		m.listCollapsed = !m.listCollapsed
+	}
+	return m, nil
+}
+
+// handleListPrefix handles the key after Ctrl+A while the list has focus.
+func (m appModel) handleListPrefix(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.muxMgr.TabCount() == 0 {
+		return m, nil
+	}
+	switch msg.String() {
+	case "e":
+		m.listCollapsed = true
+		m.focus = focusTerm
+	case "right", "l", "d":
+		m.focus = focusTerm
+	}
 	return m, nil
 }
 
@@ -224,36 +316,41 @@ func (m appModel) View() string {
 		return m.login.View()
 
 	case screenServers:
-		header := m.renderStatusBar()
-		return header + "\n\n" + m.serverList.View(m.width, m.height)
-
-	case screenUserSelect:
-		if m.selectedServer == nil {
-			return "No server selected"
-		}
-		srv := m.selectedServer
-		return fmt.Sprintf(
-			"%s\n\n"+
-				"  Server: %s\n"+
-				"  IP:     %s\n"+
-				"  IDC:    %s\n"+
-				"  OS:     %s\n\n"+
-				"  Select user:\n"+
-				"    %s  irteam\n"+
-				"    %s  irteamsu\n\n"+
-				"%s",
-			titleStyle.Render("👤 Select User"),
-			selectedStyle.Render(srv.HostName),
-			srv.PrimaryIP(),
-			srv.IDCName,
-			srv.OSName,
-			selectedStyle.Render("[1]"),
-			selectedStyle.Render("[2]"),
-			helpStyle.Render("  1/2: select user • esc/q: back"),
-		)
+		return m.renderStatusBar() + "\n" + m.renderBody() + "\n" + m.renderHelpLine()
 	}
 
 	return "Loading..."
+}
+
+// renderBody places the server list and the terminal area side by side.
+func (m appModel) renderBody() string {
+	height := m.bodyHeight()
+	term := strings.Split(m.muxMgr.View(m.focus == focusTerm), "\n")
+	lw := m.listWidth()
+	if lw == 0 {
+		return strings.Join(term, "\n")
+	}
+
+	m.serverList.tabCount = m.muxMgr.TabCount()
+	m.serverList.openUsers = m.muxMgr.OpenUsers()
+	list := strings.Split(m.serverList.View(lw, height), "\n")
+
+	sepStyle := dimStyle
+	if m.focus == focusList {
+		sepStyle = selectedStyle
+	}
+	sep := sepStyle.Render("│")
+
+	var b strings.Builder
+	for i := 0; i < height; i++ {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(lineAt(list, i))
+		b.WriteString(sep)
+		b.WriteString(lineAt(term, i))
+	}
+	return b.String()
 }
 
 func (m appModel) renderStatusBar() string {
@@ -261,11 +358,30 @@ func (m appModel) renderStatusBar() string {
 	if !m.krbOk {
 		krbStatus = krbExpiredStyle.Render("● expired")
 	}
-	sessInfo := ""
-	if n := m.muxMgr.SessionCount(); n > 0 {
-		sessInfo = fmt.Sprintf("  [%d sessions: m to attach]", n)
+	left := statusBarStyle.Render(fmt.Sprintf("🔑 %s  %s", m.principal, krbStatus))
+	right := dimStyle.Render(m.serverList.cacheInfo)
+	if m.serverList.toast != "" {
+		right = successStyle.Render("✓ "+m.serverList.toast) + "  " + right
 	}
-	return statusBarStyle.Render(fmt.Sprintf(" 🔑 %s  %s%s ", m.principal, krbStatus, sessInfo))
+	gap := m.width - ansi.StringWidth(left) - ansi.StringWidth(right) - 1
+	if gap < 1 {
+		return fitLine(left, m.width)
+	}
+	return fitLine(left+strings.Repeat(" ", gap)+right, m.width)
+}
+
+// renderHelpLine shows the focused area and its keys on the last line.
+func (m appModel) renderHelpLine() string {
+	var badge, help string
+	if m.focus == focusTerm {
+		badge = activeTabStyle.Render("TERM")
+		help = "^A ?: help • ^A d/←: server list • ^A e: hide/show list • ^A u: irteam↔irteamsu • ^A c: duplicate • ^A Space: layout • ^A z: zoom • ^A b: broadcast"
+	} else {
+		m.serverList.tabCount = m.muxMgr.TabCount()
+		badge = activeTabStyle.Render("LIST")
+		help = m.serverList.helpText()
+	}
+	return fitLine(badge+" "+helpStyle.Render(help), m.width)
 }
 
 // --- Server loading ---
@@ -333,25 +449,33 @@ func (m appModel) refreshServers() tea.Cmd {
 
 // --- SSH + Multiplexer ---
 
-func (m appModel) connectSSH() tea.Cmd {
-	if m.selectedServer == nil {
-		return nil
+// connectSSH opens the selected server in the multiplexer and focuses the
+// terminal. A server that already has a tab is focused instead of opening
+// another connection, unless a new tab is requested.
+func (m *appModel) connectSSH(srv server.CIServer, mode connectMode) tea.Cmd {
+	defaultUser := m.cfg.SSH.DefaultUser
+	if defaultUser == "" {
+		defaultUser = "irteam"
 	}
-	srv := m.selectedServer
 
-	// Add session to multiplexer
-	err := m.muxMgr.AddSession(srv.HostName, m.sshUser, srv.HostName)
-	if err != nil {
-		return func() tea.Msg {
-			return muxDoneMsg{}
+	var err error
+	switch mode {
+	case connectNewTab:
+		err = m.muxMgr.OpenTab(srv.HostName, srv.HostName, defaultUser)
+	case connectSu:
+		if m.muxMgr.FocusServer(srv.HostName) {
+			err = m.muxMgr.SwitchUser("irteamsu")
+		} else {
+			err = m.muxMgr.OpenTab(srv.HostName, srv.HostName, "irteamsu")
+		}
+	default:
+		if !m.muxMgr.FocusServer(srv.HostName) {
+			err = m.muxMgr.OpenTab(srv.HostName, srv.HostName, defaultUser)
 		}
 	}
-
-	return m.enterMux()
-}
-
-func (m appModel) enterMux() tea.Cmd {
-	return tea.Exec(m.muxMgr.Runner(), func(err error) tea.Msg {
-		return muxDoneMsg{}
-	})
+	if err != nil {
+		return m.serverList.setToast("✗ connect failed: " + err.Error())
+	}
+	m.focus = focusTerm
+	return nil
 }

@@ -11,25 +11,28 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 type serverListModel struct {
-	cfg       *config.Config
-	nodes     []server.ESMNode
-	viewMode  server.ViewMode
-	groups    []server.GroupView
-	cursor    int
-	expanded  map[int]bool // expanded group index
-	flatItems []flatItem
-	loading   bool
-	err       string
-	filter    string
-	searching bool
+	cfg         *config.Config
+	nodes       []server.ESMNode
+	viewMode    server.ViewMode
+	groups      []server.GroupView
+	cursor      int
+	expanded    map[int]bool // expanded group index
+	flatItems   []flatItem
+	loading     bool
+	err         string
+	filter      string
+	searching   bool
 	searchInput textinput.Model
-	cacheInfo string
-	spinner   spinner.Model
-	toast     string
-	toastTime time.Time
+	cacheInfo   string
+	spinner     spinner.Model
+	toast       string
+	toastTime   time.Time
+	tabCount    int                 // open mux tabs, for help text
+	openUsers   map[string][]string // hostname → users with an open session
 }
 
 type flatItem struct {
@@ -42,8 +45,19 @@ type serversLoadedMsg struct {
 	cacheInfo string
 }
 type serversErrorMsg struct{ err error }
+
+// connectMode says how a selected server should be opened.
+type connectMode int
+
+const (
+	connectDefault connectMode = iota // focus the server's tab, or open one as the default user
+	connectSu                         // focus the server's tab and switch it to irteamsu
+	connectNewTab                     // always open a new tab as the default user
+)
+
 type serverSelectedMsg struct {
 	server server.CIServer
+	mode   connectMode
 }
 type toastClearMsg struct{}
 
@@ -216,10 +230,18 @@ func (m serverListModel) Update(msg tea.Msg) (serverListModel, tea.Cmd) {
 					m.expanded[item.groupIndex] = !m.expanded[item.groupIndex]
 					m.rebuildFlat()
 				} else {
-					srv := m.groups[item.groupIndex].Servers[item.serverIndex]
-					return m, func() tea.Msg {
-						return serverSelectedMsg{server: srv}
+					return m, m.selectServer(item, connectDefault)
+				}
+			}
+		case "s", "o":
+			if m.cursor < len(m.flatItems) {
+				item := m.flatItems[m.cursor]
+				if item.serverIndex >= 0 {
+					mode := connectSu
+					if msg.String() == "o" {
+						mode = connectNewTab
 					}
+					return m, m.selectServer(item, mode)
 				}
 			}
 		case "left", "h":
@@ -294,53 +316,55 @@ func (m serverListModel) Update(msg tea.Msg) (serverListModel, tea.Cmd) {
 	return m, nil
 }
 
+func (m serverListModel) selectServer(item flatItem, mode connectMode) tea.Cmd {
+	srv := m.groups[item.groupIndex].Servers[item.serverIndex]
+	return func() tea.Msg {
+		return serverSelectedMsg{server: srv, mode: mode}
+	}
+}
+
+// View renders the server list panel — view mode tabs, search line and the
+// list — as exactly height lines of exactly width columns.
 func (m serverListModel) View(width, height int) string {
-	var b strings.Builder
-
-	// Title bar with view mode indicator
-	b.WriteString(titleStyle.Render("📡 Server List"))
-	b.WriteString("  ")
-	b.WriteString(m.renderViewModeTabs())
-	if m.cacheInfo != "" {
-		b.WriteString("  " + dimStyle.Render(m.cacheInfo))
-	}
-	if m.toast != "" {
-		b.WriteString("  " + successStyle.Render("✓ "+m.toast))
-	}
-	b.WriteString("\n")
-
-	// Search bar
-	if m.searching {
-		b.WriteString("  " + m.searchInput.View() + "\n")
-	} else if m.filter != "" {
-		b.WriteString("  " + dimStyle.Render(fmt.Sprintf("filter: \"%s\"  (esc: clear)", m.filter)) + "\n")
-	} else {
-		b.WriteString("\n")
+	lines := []string{m.renderViewModeTabs()}
+	switch {
+	case m.searching:
+		lines = append(lines, " "+m.searchInput.View())
+	case m.filter != "":
+		lines = append(lines, dimStyle.Render(fmt.Sprintf(" filter: \"%s\"  (esc: clear)", m.filter)))
+	default:
+		lines = append(lines, dimStyle.Render(" Search: /"))
 	}
 
-	if m.loading {
-		b.WriteString(fmt.Sprintf("  %s Refreshing servers...\n", m.spinner.View()))
-		if len(m.flatItems) > 0 {
-			b.WriteString("\n")
-			m.renderList(&b, width, height-3)
+	switch {
+	case m.err != "":
+		lines = append(lines, " "+errorStyle.Render("✗ "+m.err), helpStyle.Render(" r: retry"))
+	case m.loading && len(m.flatItems) == 0:
+		lines = append(lines, fmt.Sprintf(" %s Loading servers...", m.spinner.View()))
+	case len(m.flatItems) == 0:
+		lines = append(lines, " No servers found. Press 'r' to refresh.")
+	default:
+		if m.loading {
+			lines = append(lines, fmt.Sprintf(" %s Refreshing servers...", m.spinner.View()))
 		}
-		return b.String()
+		lines = append(lines, m.listLines(height-len(lines))...)
 	}
+	return fitBlock(lines, width, height)
+}
 
-	if m.err != "" {
-		b.WriteString("  " + errorStyle.Render("✗ "+m.err) + "\n")
-		b.WriteString(helpStyle.Render("  r: retry • q: quit"))
-		return b.String()
+// helpText is the key help for the status line while the list has focus.
+func (m serverListModel) helpText() string {
+	if m.searching {
+		return "type to search • enter: confirm • esc: cancel"
 	}
-
-	if len(m.flatItems) == 0 {
-		b.WriteString("  No servers found. Press 'r' to refresh from API.\n")
-		return b.String()
+	help := "enter: connect • s: as irteamsu • o: new tab • /: search • tab: view mode • b/B: bookmark • r: refresh"
+	if m.filter != "" {
+		help += " • esc: clear filter"
 	}
-
-	m.renderList(&b, width, height)
-
-	return b.String()
+	if m.tabCount > 0 {
+		help += fmt.Sprintf(" • esc/m: terminal (%d) • ^A e: hide list", m.tabCount)
+	}
+	return help + " • q: quit"
 }
 
 func (m serverListModel) renderViewModeTabs() string {
@@ -357,44 +381,73 @@ func (m serverListModel) renderViewModeTabs() string {
 	return strings.Join(parts, "")
 }
 
-func (m serverListModel) renderList(b *strings.Builder, width, height int) {
-	visibleHeight := height - 6
-	if visibleHeight < 5 {
-		visibleHeight = 5
+// listLines renders the rows of the list that fit in visible lines,
+// scrolled so the cursor stays on screen.
+func (m serverListModel) listLines(visible int) []string {
+	if visible < 1 {
+		visible = 1
 	}
-
 	startIdx := 0
-	if m.cursor >= visibleHeight {
-		startIdx = m.cursor - visibleHeight + 1
+	if m.cursor >= visible {
+		startIdx = m.cursor - visible + 1
 	}
-	endIdx := startIdx + visibleHeight
+	endIdx := startIdx + visible
 	if endIdx > len(m.flatItems) {
 		endIdx = len(m.flatItems)
 	}
 
+	lines := make([]string, 0, endIdx-startIdx)
 	for i := startIdx; i < endIdx; i++ {
 		item := m.flatItems[i]
 		prefix := "  "
 		if i == m.cursor {
 			prefix = "▸ "
 		}
-
+		var b strings.Builder
 		if item.serverIndex == -1 {
-			m.renderGroupHeader(b, i, item, prefix)
+			m.renderGroupHeader(&b, i, item, prefix)
 		} else {
-			m.renderServerRow(b, i, item, prefix)
+			m.renderServerRow(&b, i, item, prefix)
 		}
-		b.WriteString("\n")
+		lines = append(lines, b.String())
 	}
+	return lines
+}
 
-	b.WriteString("\n")
-	if m.searching {
-		b.WriteString(helpStyle.Render("  type to search • enter: confirm • esc: cancel"))
-	} else if m.filter != "" {
-		b.WriteString(helpStyle.Render("  ↑↓/jk: navigate • enter: expand/select • b: bookmark • B: clear all • /: search • esc: clear filter • tab: view mode • r: refresh • q: quit"))
-	} else {
-		b.WriteString(helpStyle.Render("  ↑↓/jk: navigate • enter: expand/select • b: bookmark • B: clear all • /: search • tab: view mode • r: refresh • q: quit"))
+// fitBlock truncates or pads lines to exactly width columns and height rows.
+func fitBlock(lines []string, width, height int) string {
+	if len(lines) > height {
+		lines = lines[:height]
 	}
+	var b strings.Builder
+	for i := 0; i < height; i++ {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(fitLine(lineAt(lines, i), width))
+	}
+	return b.String()
+}
+
+// fitLine truncates or pads one line to exactly width columns.
+func fitLine(line string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if ansi.StringWidth(line) > width {
+		line = ansi.Truncate(line, width, "…")
+	}
+	if w := ansi.StringWidth(line); w < width {
+		line += "\x1b[0m" + strings.Repeat(" ", width-w)
+	}
+	return line
+}
+
+func lineAt(lines []string, i int) string {
+	if i < len(lines) {
+		return lines[i]
+	}
+	return ""
 }
 
 func (m serverListModel) renderGroupHeader(b *strings.Builder, i int, item flatItem, prefix string) {
@@ -472,6 +525,13 @@ func (m serverListModel) renderServerRow(b *strings.Builder, i int, item flatIte
 		b.WriteString(selectedStyle.Render(host))
 	} else {
 		b.WriteString(dimStyle.Render(host))
+	}
+	for _, u := range m.openUsers[srv.HostName] {
+		if u == "irteamsu" {
+			b.WriteString(" " + suChipStyle.Render(u))
+		} else {
+			b.WriteString(" " + userChipStyle.Render(u))
+		}
 	}
 	b.WriteString(serverInfoStyle.Render(ip))
 	b.WriteString(dimStyle.Render(idc))
