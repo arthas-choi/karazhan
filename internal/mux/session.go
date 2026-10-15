@@ -24,6 +24,7 @@ type Session struct {
 	ptmx *os.File
 	vt   vt10x.Terminal // virtual terminal the multiplexer renders from
 	wide wideFilter     // pads double-width characters for vt
+	clip clipFilter     // pulls OSC 52 clipboard writes out of the stream
 
 	mu   sync.Mutex
 	done bool
@@ -135,11 +136,14 @@ func (s *Session) Write(data []byte) (int, error) {
 	return s.ptmx.Write(data)
 }
 
-// WriteToVT writes data to the virtual terminal buffer.
-func (s *Session) WriteToVT(data []byte) {
+// WriteToVT feeds PTY output to the virtual terminal. OSC 52 clipboard
+// writes are removed from the stream and returned as decoded text.
+func (s *Session) WriteToVT(data []byte) (clips []string) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, clips = s.clip.apply(data)
 	s.vt.Write(s.wide.apply(data))
-	s.mu.Unlock()
+	return clips
 }
 
 // AppCursor reports whether the program switched arrow keys to application

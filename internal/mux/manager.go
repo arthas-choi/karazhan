@@ -42,6 +42,10 @@ type Manager struct {
 	// updates is signalled (coalesced) whenever a session's screen changes
 	// or a session ends.
 	updates chan struct{}
+
+	// clips holds clipboard text set by sessions (OSC 52) that the host UI
+	// has not yet forwarded to the real terminal.
+	clips []string
 }
 
 func NewManager(mock bool) *Manager {
@@ -167,6 +171,16 @@ func (m *Manager) OpenUsers() map[string][]string {
 		}
 	}
 	return out
+}
+
+// TakeClipboard returns and clears the clipboard texts sessions have set
+// since the last call, oldest first.
+func (m *Manager) TakeClipboard() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	clips := m.clips
+	m.clips = nil
+	return clips
 }
 
 func (m *Manager) TabCount() int {
@@ -371,7 +385,11 @@ func (m *Manager) readLoop(s *Session) {
 	for {
 		n, err := s.Read(buf)
 		if n > 0 {
-			s.WriteToVT(buf[:n])
+			if clips := s.WriteToVT(buf[:n]); len(clips) > 0 {
+				m.mu.Lock()
+				m.clips = append(m.clips, clips...)
+				m.mu.Unlock()
+			}
 			m.notify()
 		}
 		if err != nil {

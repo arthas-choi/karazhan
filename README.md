@@ -138,6 +138,29 @@ All multiplexer commands use the `Ctrl+A` prefix (like tmux).
 | `Ctrl+A Ctrl+A` | Send a literal `Ctrl+A` |
 | `Ctrl+A ?` | Show help |
 
+### Clipboard (copying from a remote vim)
+
+Programs that set the clipboard with OSC 52 work through the multiplexer:
+the sequence is taken out of the session's output and replayed on your
+terminal, so a yank in a remote vim lands in the local clipboard no matter
+how long the file is.
+
+- iTerm2: Settings → General → Selection → enable
+  *Applications in terminal may access clipboard*.
+- Neovim 0.10+ supports OSC 52 out of the box. For Vim, install
+  [vim-oscyank](https://github.com/ojroques/vim-oscyank) or add to the
+  server's `~/.vimrc`:
+
+  ```vim
+  autocmd TextYankPost * if v:event.operator ==# 'y' |
+    \ call writefile(["\e]52;c;" . system('base64 | tr -d "\n"', join(v:event.regcontents, "\n")) . "\x07"], '/dev/tty', 'b') |
+    \ endif
+  ```
+
+Then `:%y` copies the whole file and `V` + `y` copies a range. Mouse
+selection still works for what is on screen; hide the list with `Ctrl+A e`
+or hold `Option` while dragging to select one pane.
+
 ## Prerequisites
 
 - **Kerberos** - A valid Kerberos setup (`kinit`, `klist` available in PATH)

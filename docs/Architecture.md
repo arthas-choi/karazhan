@@ -73,6 +73,7 @@ internal/
     ├── tab.go      # Tab = one server, one session per SSH user
     ├── session.go  # SSH session: PTY + vt10x virtual terminal
     ├── widefilter.go # Pads double-width (CJK) characters for vt10x
+    ├── clipboard.go  # Strips OSC 52 clipboard writes for replay on the real terminal
     ├── layout.go   # Split presets, pane geometry, directional focus
     ├── render.go   # Cell-grid frame compositor (panes, headers, cursor)
     └── tabbar.go   # Tab bar & help overlay
@@ -161,9 +162,12 @@ Bubble Tea event loop (internal/tui)
 
 Per-session goroutine (Manager.readLoop)
   ├─ Read from the PTY
+  ├─ clipFilter removes OSC 52 clipboard writes → Manager.TakeClipboard
   ├─ wideFilter pads double-width characters
   ├─ Write into the session's vt10x virtual terminal
   └─ Signal the Updates channel → Bubble Tea redraws
+      └─ the app replays pending clipboard text as OSC 52 at the start of
+         its view for ~120 ms, so one renderer flush carries it to the terminal
 ```
 
 ## Key Design Decisions
@@ -193,6 +197,16 @@ columns, so a filter inserts a padding rune after each double-width character
 before it reaches vt10x and the renderer skips it. The virtual terminal is
 also given the PTY as its writer so it can answer status queries (cursor
 position etc.) the way a real terminal would.
+
+### Clipboard passthrough (OSC 52)
+
+vt10x has no clipboard, so a remote program's OSC 52 write would be lost.
+The session strips it from the output stream, the manager queues the decoded
+text, and the app prepends an OSC 52 sequence to its view. The sequence is
+zero-width, so the layout is unchanged, and Bubble Tea's renderer writes it
+to the terminal together with the frame. It stays in the view for a short
+hold because the renderer only flushes the latest view per tick; writing to
+stdout directly would race with the renderer and could corrupt a frame.
 
 ### Split presets instead of free-form splits
 

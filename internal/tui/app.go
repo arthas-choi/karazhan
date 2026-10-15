@@ -34,6 +34,11 @@ const (
 // frameInterval coalesces bursts of terminal output into one redraw.
 const frameInterval = 16 * time.Millisecond
 
+// clipHold is how long a clipboard sequence stays in the view. Bubble Tea
+// only flushes the latest view each frame, so it must survive several
+// Updates to be sure one flush carries it to the terminal.
+const clipHold = 120 * time.Millisecond
+
 type appModel struct {
 	cfg       *config.Config
 	screen    screen
@@ -49,6 +54,12 @@ type appModel struct {
 	focus         focusArea
 	listCollapsed bool // Ctrl+A e: terminal takes the whole width
 	listPrefix    bool // Ctrl+A pressed while the list has focus
+
+	// pendingClip is text a session put on the clipboard (OSC 52); it is
+	// replayed to the real terminal at the start of the view until clipSeq's
+	// clipClearMsg arrives.
+	pendingClip string
+	clipSeq     int
 }
 
 func NewApp(cfg *config.Config) appModel {
@@ -109,6 +120,13 @@ func waitTermUpdate(mgr *mux.Manager) tea.Cmd {
 		time.Sleep(frameInterval)
 		return termUpdateMsg{}
 	}
+}
+
+// clipClearMsg ends the hold of the clipboard sequence with the given seq.
+type clipClearMsg struct{ seq int }
+
+func clearClip(seq int) tea.Cmd {
+	return tea.Tick(clipHold, func(time.Time) tea.Msg { return clipClearMsg{seq: seq} })
 }
 
 // --- Layout ---
@@ -172,7 +190,18 @@ func (m appModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case termUpdateMsg:
 		m.muxMgr.Prune()
+		if clips := m.muxMgr.TakeClipboard(); len(clips) > 0 {
+			m.pendingClip = clips[len(clips)-1]
+			m.clipSeq++
+			return m, tea.Batch(waitTermUpdate(m.muxMgr), clearClip(m.clipSeq))
+		}
 		return m, waitTermUpdate(m.muxMgr)
+
+	case clipClearMsg:
+		if msg.seq == m.clipSeq {
+			m.pendingClip = ""
+		}
+		return m, nil
 
 	case tea.KeyMsg:
 		if m.screen == screenServers && m.focus == focusTerm {
@@ -311,6 +340,16 @@ func (m appModel) handleListPrefix(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // --- View ---
 
 func (m appModel) View() string {
+	view := m.view()
+	if m.pendingClip != "" {
+		// Zero-width, so the layout is unchanged; the renderer forwards it
+		// to the terminal, which sets its clipboard.
+		view = mux.OSC52(m.pendingClip) + view
+	}
+	return view
+}
+
+func (m appModel) view() string {
 	switch m.screen {
 	case screenLogin:
 		return m.login.View()
